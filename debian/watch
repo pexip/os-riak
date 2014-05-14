@@ -1,0 +1,5 @@
+# Compulsory line, this is a version 3 file
+version=3
+
+# <Webpage URL> <string match>
+http://docs.basho.com/riak/latest/downloads/ riak-(.*)\.tar\.gz

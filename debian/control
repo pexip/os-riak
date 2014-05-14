@@ -1,0 +1,13 @@
+Source: riak
+Section: net
+Priority: extra
+Maintainer: Pexip AS <packaging@pexip.com>
+Build-Depends: debhelper (>= 8.0.0), erlang
+Standards-Version: 3.9.2
+Homepage: http://basho.com/riak/
+
+Package: riak
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Riak distributed database
+ Riak distributed database

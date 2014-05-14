@@ -1,0 +1,207 @@
+Format: http://dep.debian.net/deps/dep5
+Upstream-Name: riak
+Source: http://basho.com/riak/
+
+Files: deps/basho_stats/*
+Copyright: 2009 Dave Smith (dizzyd@dizzyd.com)
+License: Apache-2.0
+
+Files: deps/bear/*
+Copyright: 2011 Boundary <j@boundary.com>
+License: Apache-2.0
+
+Files: deps/bitcask/*
+Copyright: 2010 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/cluster_info/*
+Copyright: 2002-2010 Gemini Mobile Technologies, Inc
+License: Apache-2.0
+
+Files: deps/ebloom/*
+Copyright: 2010 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/edown/*
+Copyright: 2010 Erlang Solutions Ltd
+License: Apache-2.0
+
+Files: deps/eleveldb/*
+Copyright: 2010-2012 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/eper/*
+Copyright: 2008 mats cronqvist
+License: MIT
+
+Files: deps/erlang_js/*
+Copyright: 2009-2010 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/erlydtl/*
+Copyright: 2008 Roberto Saccon <rsaccon@gmail.com>
+           2008 Evan Miller <emmiller@gmail.com>
+License: MIT
+
+Files: deps/folsom/*
+Copyright: 2011 Boundary <j@boundary.com>
+License: Apache-2.0
+
+Files: deps/getopt/*
+Copyright: 2009 Juan Jose Comellas
+License: BSD
+ All rights reserved.
+ .
+ Redistribution and use in source and binary forms, with or without modification,
+ are permitted provided that the following conditions are met:
+ .
+   - Redistributions of source code must retain the above copyright notice, this
+     list of conditions and the following disclaimer.
+ .
+   - Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+ .
+   - Neither the name of Juan Jose Comellas nor the names of its contributors may
+     be used to endorse or promote products derived from this software without
+     specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Files: deps/goldrush/*
+Copyright: 2012 Magnus Klaar <klaar@ninenines.eu>
+License: MIT
+
+Files: deps/ibrowse/*
+Copyright: 2005-2010 Chandrashekhar Mullaparthi <chandrashekhar.mullaparthi@gmail.com>
+License: LGPL-2.1+
+
+Files: deps/lager/*
+Copyright: 2011-2012 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/lager_syslog/*
+Copyright: 2011-2012 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/meck/*
+Copyright: 2011 Adam Lindberg
+           2011 Erlang Solutions Ltd
+License: Apache-2.0
+
+Files: deps/merge_index/*
+Copyright: 2007-2011 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/mochiweb/*
+Copyright: 2007 Mochi Media, Inc
+License: MIT
+
+Files: deps/node_package/*
+Copyright: 2013 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/poolboy/*
+Copyright: Devin Torres <devin@devintorres.com>
+           Andrew Thompson <andrew@hijacked.us>
+           Kurt Williams <kurt.r.williams@gmail.com>
+License: Apache-2.0
+
+Files: deps/protobuffs/*
+Copyright: 2009 Nick Gerakines <nick@gerakines.net>
+           2009 Jacob Vorreuter <jacob.vorreuter@gmail.com>
+License: MIT
+
+Files: deps/ranch/*
+Copyright: 2011-2012 Loïc Hoguin <essen@ninenines.eu>
+License: MIT
+
+Files: deps/riak_api/*
+Copyright: 2007-2010 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_control/*
+Copyright: 2011 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_core/*
+Copyright: 2007-2011 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_kv/*
+Copyright: 2007-2010 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_pb/*
+Copyright: 2012 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_pipe/*
+Copyright: 2011 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_search/*
+Copyright: 2007-2010 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riak_sysmon/*
+Copyright: 2011 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/riaknostic/*
+Copyright: 2011 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/sext/*
+Copyright: 2010 Erlang Solutions Ltd
+License: Apache-2.0
+
+Files: deps/sidejob/*
+Copyright: 2013 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: deps/syslog/*
+Copyright: 2009 Andrew Thompson <andrew@hijacked.us>
+License: MIT
+ All rights reserved.
+ .
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ .
+   1. Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+   2. Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+ .
+ THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR
+ IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+ EVENT SHALL THE CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+ INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Files: deps/webmachine/*
+Copyright: 2007-2009 Basho Technologies, Inc
+License: Apache-2.0
+
+Files: debian/*
+Copyright: Pexip AS <packaging@pexip.com>
+License: MIT
+
+Files: *
+Copyright: 2007-2009 Basho Technologies
+License: Apache-2.0
