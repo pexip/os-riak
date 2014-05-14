@@ -36,6 +36,9 @@ do_start()
 	rm -rf /var/run/riak || return 1
 	install -d --mode=0755 -o $NAME -g $NAME /var/run/riak || return 1
 
+	# Increase open file handle limit
+	ulimit -n 4096
+
 	# Return
 	#   0 if daemon has been started
 	#   1 if daemon was already running
