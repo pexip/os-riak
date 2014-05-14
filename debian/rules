@@ -1,5 +1,7 @@
 #!/usr/bin/make -f
 
+VERSION=$(shell dpkg-parsechangelog | sed -n -e 's/^Version: \([^-]*\).*/\1/p')
+
 override_dh_auto_clean:
 
 override_dh_auto_build:
@@ -8,6 +10,7 @@ override_dh_auto_build:
 override_dh_auto_test:
 
 override_dh_auto_install:
+	echo "{app_version, \"$(VERSION)\"}." >>$(CURDIR)/rel/vars.config
 	make generate
 	mkdir -p $(CURDIR)/debian/riak/usr/lib/riak
 	mv rel/riak/erts-* $(CURDIR)/debian/riak/usr/lib/riak/
