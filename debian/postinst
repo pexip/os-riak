@@ -30,7 +30,7 @@ case "$1" in
 	adduser --ingroup riak --home /var/lib/riak --disabled-password --system --shell /bin/bash --no-create-home --gecos riak riak
     fi
 
-    for i in lib run log; do
+    for i in lib log; do
 	chown -R riak:riak /var/$i/riak
     done
 
