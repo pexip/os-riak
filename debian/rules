@@ -2,7 +2,22 @@
 
 override_dh_auto_clean:
 
+override_dh_auto_build:
+	make compile
+
 override_dh_auto_test:
+
+override_dh_auto_install:
+	make generate
+	mkdir -p $(CURDIR)/debian/riak/usr/lib/riak
+	mv rel/riak/erts-* $(CURDIR)/debian/riak/usr/lib/riak/
+	mv rel/riak/lib $(CURDIR)/debian/riak/usr/lib/riak/
+	mv rel/riak/releases $(CURDIR)/debian/riak/usr/lib/riak/
+	mv rel/riak/bin $(CURDIR)/debian/riak/usr/sbin
+	mkdir -p $(CURDIR)/debian/riak/etc
+	mv rel/riak/etc $(CURDIR)/debian/riak/etc/riak
+	mkdir -p $(CURDIR)/debian/riak/var/lib/riak/ring
+	mkdir -p $(CURDIR)/debian/riak/var/log/riak
 
 %:
 	dh $@ 
