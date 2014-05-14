@@ -1,0 +1,16 @@
+diff --git a/deps/erlang_js/c_src/patches/js-src-config-Linux.mk.patch b/deps/erlang_js/c_src/patches/js-src-config-Linux.mk.patch
+new file mode 100644
+index 0000000..fd27e84
+--- /dev/null
++++ b/deps/erlang_js/c_src/patches/js-src-config-Linux.mk.patch
+@@ -0,0 +1,10 @@
++--- csrc.orig/js/src/config/Linux_All.mk	2014-05-14 15:34:39.228142037 +0000
+++++ csrc/js/src/config/Linux_All.mk	2014-05-14 15:34:15.912434281 +0000
++@@ -43,6 +43,7 @@
++ 
++ CC = gcc
++ CCC = g++
+++LD = gcc
++ CFLAGS +=  -Wall -Wno-format -MMD
++ OS_CFLAGS = -DXP_UNIX -DSVR4 -DSYSV -D_BSD_SOURCE -DPOSIX_SOURCE -DHAVE_LOCALTIME_R
++ 
