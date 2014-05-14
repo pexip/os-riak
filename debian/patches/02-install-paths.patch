@@ -1,0 +1,40 @@
+diff --git a/rel/vars.config b/rel/vars.config
+index f8947e5..c0908b0 100644
+--- a/rel/vars.config
++++ b/rel/vars.config
+@@ -2,11 +2,11 @@
+ %% ex: ft=erlang ts=4 sw=4 et
+ 
+ %% Platform-specific installation paths
+-{platform_bin_dir,  "./bin"}.
+-{platform_data_dir, "./data"}.
+-{platform_etc_dir,  "./etc"}.
+-{platform_lib_dir,  "./lib"}.
+-{platform_log_dir,  "./log"}.
++{platform_bin_dir,  "/usr/sbin"}.
++{platform_data_dir, "/var/lib/riak"}.
++{platform_etc_dir,  "/etc/riak"}.
++{platform_lib_dir,  "/usr/lib/riak/lib"}.
++{platform_log_dir,  "/var/log/riak"}.
+ 
+ %%
+ %% etc/app.config
+@@ -47,12 +47,12 @@
+ %%
+ %% bin/riak
+ %%
+-{runner_script_dir,  "$(cd ${0%/*} && pwd)"}.
+-{runner_base_dir,    "{{runner_script_dir}}/.."}.
+-{runner_etc_dir,     "$RUNNER_BASE_DIR/etc"}.
+-{runner_log_dir,     "$RUNNER_BASE_DIR/log"}.
++{runner_script_dir,  "/usr/sbin"}.
++{runner_base_dir,    "/usr/lib/riak"}.
++{runner_etc_dir,     "/etc/riak"}.
++{runner_log_dir,     "/var/log/riak"}.
+ {runner_lib_dir,     "$RUNNER_BASE_DIR/lib"}.
+ {runner_patch_dir,   "$RUNNER_BASE_DIR/lib/basho-patches"}.
+-{pipe_dir,           "/tmp/$RUNNER_BASE_DIR/"}.
+-{runner_user,        ""}.
++{pipe_dir,           "/tmp/riak/"}.
++{runner_user,        "riak"}.
+ {runner_wait_process, "riak_core_node_watcher"}.
