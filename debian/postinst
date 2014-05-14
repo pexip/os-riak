@@ -37,7 +37,6 @@ case "$1" in
     chown -R riak:riak /usr/lib/riak
     chown -R riak:riak /etc/riak
 
-    chmod 0755 /var/run/riak /etc/riak
     chmod 0644 /etc/riak/*
     chmod -R +X /etc/riak
     chmod 0755 /usr/lib/riak/lib/env.sh

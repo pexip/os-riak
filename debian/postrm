@@ -32,9 +32,6 @@ case "$1" in
         if [ -d /var/log/riak ]; then
                 rm -r /var/log/riak
         fi
-        if [ -d /var/run/riak ]; then
-                rm -r /var/run/riak
-        fi
         if [ -d /etc/riak ]; then
                 rm -r /etc/riak
         fi
