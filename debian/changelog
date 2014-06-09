@@ -1,3 +1,9 @@
+riak (1.4.8-1pexip1) pexip; urgency=low
+
+  * Fix default app.config.erb to better suit pexip
+
+ -- Ben Hockley <ben@pexip.com>  Mon, 01 Jun 2014 15:01:23 +0100
+
 riak (1.4.8-1) unstable; urgency=low
 
   * Initial release
