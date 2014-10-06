@@ -1,3 +1,4 @@
 01-erlang_js-build.patch
 02-install-paths.patch
 03-customise-app-config.patch
+04-md5.patch

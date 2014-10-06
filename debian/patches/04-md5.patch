@@ -1,0 +1,64 @@
+diff --git a/deps/riak_kv/src/hashtree.erl b/deps/riak_kv/src/hashtree.erl
+index 16e5c52..0aa5623 100644
+--- a/deps/riak_kv/src/hashtree.erl
++++ b/deps/riak_kv/src/hashtree.erl
+@@ -473,7 +473,7 @@ new_segment_store(Opts, State) ->
+     DataDir = case proplists:get_value(segment_path, Opts) of
+                   undefined ->
+                       Root = "/tmp/anti/level",
+-                      <<P:128/integer>> = crypto:md5(term_to_binary(erlang:now())),
++                      <<P:128/integer>> = erlang:md5(term_to_binary(erlang:now())),
+                       filename:join(Root, integer_to_list(P));
+                   SegmentPath ->
+                       SegmentPath
+diff --git a/deps/riak_kv/src/riak_kv_util.erl b/deps/riak_kv/src/riak_kv_util.erl
+index f54c24f..2b8c084 100644
+--- a/deps/riak_kv/src/riak_kv_util.erl
++++ b/deps/riak_kv/src/riak_kv_util.erl
+@@ -341,7 +341,7 @@ mark_indexes_reformatted(_Idx, _ErrorCount, _ForUpgrade) ->
+ %% @Doc vtag creation function
+ -spec make_vtag(erlang:timestamp()) -> list().
+ make_vtag(Now) ->
+-    <<HashAsNum:128/integer>> = crypto:md5(term_to_binary({node(), Now})),
++    <<HashAsNum:128/integer>> = erlang:md5(term_to_binary({node(), Now})),
+     riak_core_util:integer_to_list(HashAsNum,62).
+ 
+ overload_reply({raw, ReqId, Pid}) ->
+diff --git a/deps/riak_kv/src/riak_kv_wm_object.erl b/deps/riak_kv/src/riak_kv_wm_object.erl
+index 4d28fc0..a54984f 100644
+--- a/deps/riak_kv/src/riak_kv_wm_object.erl
++++ b/deps/riak_kv/src/riak_kv_wm_object.erl
+@@ -912,7 +912,7 @@ generate_etag(RD, Ctx) ->
+             {dict:fetch(?MD_VTAG, MD), RD, Ctx};
+         multiple_choices ->
+             {ok, Doc} = Ctx#ctx.doc,
+-            <<ETag:128/integer>> = crypto:md5(term_to_binary(riak_object:vclock(Doc))),
++            <<ETag:128/integer>> = erlang:md5(term_to_binary(riak_object:vclock(Doc))),
+             {riak_core_util:integer_to_list(ETag, 62), RD, Ctx}
+     end.
+ 
+diff --git a/deps/webmachine/src/webmachine_decision_core.erl b/deps/webmachine/src/webmachine_decision_core.erl
+index 194c48d..fb81046 100644
+--- a/deps/webmachine/src/webmachine_decision_core.erl
++++ b/deps/webmachine/src/webmachine_decision_core.erl
+@@ -736,16 +736,16 @@ md5_final(Ctx) ->
+     crypto:hash_final(Ctx).
+ -else.
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ 
+ md5_init() ->
+-    crypto:md5_init().
++    erlang:md5_init().
+ 
+ md5_update(Ctx, Bin) ->
+-    crypto:md5_update(Ctx, Bin).
++    erlang:md5_update(Ctx, Bin).
+ 
+ md5_final(Ctx) ->
+-    crypto:md5_final(Ctx).
++    erlang:md5_final(Ctx).
+ -endif.
+ 
+ 
