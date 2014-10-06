@@ -1,3 +1,10 @@
+riak (1.4.8-2) unstable; urgency=low
+
+  * Stop before upgrade
+  * Rebuild against updated Erlang
+
+ -- John-Mark Bell <jmb@pexip.com>  Mon, 06 Oct 2014 18:33:37 +0100
+
 riak (1.4.8-1pexip1) pexip; urgency=low
 
   * Fix default app.config.erb to better suit pexip
