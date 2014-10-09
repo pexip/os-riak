@@ -1,3 +1,9 @@
+riak (1.4.8-4) pexip; urgency=low
+
+  * Reinstate app.config changes lost in -[23].
+
+ -- John-Mark Bell <jmb@pexip.com>  Thu, 09 Oct 2014 17:07:12 +0100
+
 riak (1.4.8-3) pexip; urgency=low
 
   * Use erlang MD5 in place of crypto library implementation
