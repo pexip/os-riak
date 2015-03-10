@@ -1,3 +1,9 @@
+riak (1.4.8-5) pexip; urgency=low
+
+  * Restrict ports used for distribution.
+
+ -- John-Mark Bell <jmb@pexip.com>  Tue, 10 Mar 2015 18:40:38 +0000
+
 riak (1.4.8-4) pexip; urgency=low
 
   * Reinstate app.config changes lost in -[23].

@@ -1,5 +1,5 @@
 diff --git a/rel/files/app.config b/rel/files/app.config
-index a646e78..e112e56 100644
+index a646e78..f78f64c 100644
 --- a/rel/files/app.config
 +++ b/rel/files/app.config
 @@ -1,5 +1,6 @@
@@ -42,3 +42,17 @@ index a646e78..e112e56 100644
  
              %% raw_name is the first part of all URLS used by the Riak raw HTTP
              %% interface.  See riak_web.erl and raw_http_resource.erl for
+@@ -335,5 +345,12 @@
+                 %% components, each of which is enabled or disabled
+                 %% by one of these settings.
+                 {admin, true}
+-                ]}
++                ]},
++
++ %% Erlang kernel config
++ {kernel, [
++          %% Restrict ports used for Erlang distribution protocol.
++          {inet_dist_listen_min, 6000},
++          {inet_dist_listen_max, 6999}
++          ]}
+ ].
