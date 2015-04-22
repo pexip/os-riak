@@ -1,3 +1,9 @@
+riak (1.4.8-6) pexip; urgency=low
+
+  * Increase ulimit -n limit for number of fds.
+
+ -- Ben Hockley <ben@pexip.com>  Wed, 22 Apr 2015 16:10:38 +0000
+
 riak (1.4.8-5) pexip; urgency=low
 
   * Restrict ports used for distribution.
