@@ -1,3 +1,9 @@
+riak (2.1.1-1) pexip; urgency=low
+
+  * New upstream release
+
+ -- John-Mark Bell <jmb@pexip.com>  Tue, 27 Oct 2015 12:15:41 +0000
+
 riak (1.4.8-6) pexip; urgency=low
 
   * Increase ulimit -n limit for number of fds.

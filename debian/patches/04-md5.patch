@@ -1,48 +1,156 @@
-diff --git a/deps/riak_kv/src/hashtree.erl b/deps/riak_kv/src/hashtree.erl
-index 16e5c52..0aa5623 100644
---- a/deps/riak_kv/src/hashtree.erl
-+++ b/deps/riak_kv/src/hashtree.erl
-@@ -473,7 +473,7 @@ new_segment_store(Opts, State) ->
-     DataDir = case proplists:get_value(segment_path, Opts) of
-                   undefined ->
-                       Root = "/tmp/anti/level",
--                      <<P:128/integer>> = crypto:md5(term_to_binary(erlang:now())),
-+                      <<P:128/integer>> = erlang:md5(term_to_binary(erlang:now())),
-                       filename:join(Root, integer_to_list(P));
-                   SegmentPath ->
-                       SegmentPath
-diff --git a/deps/riak_kv/src/riak_kv_util.erl b/deps/riak_kv/src/riak_kv_util.erl
-index f54c24f..2b8c084 100644
---- a/deps/riak_kv/src/riak_kv_util.erl
-+++ b/deps/riak_kv/src/riak_kv_util.erl
-@@ -341,7 +341,7 @@ mark_indexes_reformatted(_Idx, _ErrorCount, _ForUpgrade) ->
- %% @Doc vtag creation function
- -spec make_vtag(erlang:timestamp()) -> list().
+diff --git a/deps/riak_core/contrib/handoff_perftool.erl b/deps/riak_core/contrib/handoff_perftool.erl
+index 5b3f941..d3e7bbb 100644
+--- a/deps/riak_core/contrib/handoff_perftool.erl
++++ b/deps/riak_core/contrib/handoff_perftool.erl
+@@ -186,7 +186,7 @@ finalize_object(RObj) ->
+     riak_object:apply_updates(riak_object:update_metadata(RObj, NewMD)).
+  
  make_vtag(Now) ->
 -    <<HashAsNum:128/integer>> = crypto:md5(term_to_binary({node(), Now})),
 +    <<HashAsNum:128/integer>> = erlang:md5(term_to_binary({node(), Now})),
      riak_core_util:integer_to_list(HashAsNum,62).
  
- overload_reply({raw, ReqId, Pid}) ->
+ %%
+diff --git a/deps/riak_core/src/hashtree.erl b/deps/riak_core/src/hashtree.erl
+index 6c6789a..d18d16f 100644
+--- a/deps/riak_core/src/hashtree.erl
++++ b/deps/riak_core/src/hashtree.erl
+@@ -485,7 +485,7 @@ get_bucket(Level, Bucket, State) ->
+ 
+ -ifndef(old_hash).
+ md5(Bin) ->
+-    crypto:hash(md5, Bin).
++    erlang:md5(Bin).
+ 
+ -ifdef(TEST).
+ esha(Bin) ->
+@@ -502,7 +502,7 @@ esha_final(Ctx) ->
+     crypto:hash_final(Ctx).
+ -else.
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ 
+ -ifdef(TEST).
+ esha(Bin) ->
+diff --git a/deps/riak_core/src/riak_core_util.erl b/deps/riak_core/src/riak_core_util.erl
+index 085b711..2044edd 100644
+--- a/deps/riak_core/src/riak_core_util.erl
++++ b/deps/riak_core/src/riak_core_util.erl
+@@ -203,13 +203,13 @@ sha(Bin) ->
+     crypto:hash(sha, Bin).
+ 
+ md5(Bin) ->
+-    crypto:hash(md5, Bin).
++    erlang:md5(Bin).
+ -else.
+ sha(Bin) ->
+     crypto:sha(Bin).
+ 
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ -endif.
+ 
+ %% @spec unique_id_62() -> string()
+diff --git a/deps/riak_ensemble/src/riak_ensemble_util.erl b/deps/riak_ensemble/src/riak_ensemble_util.erl
+index e2e5abd..98bad3b 100644
+--- a/deps/riak_ensemble/src/riak_ensemble_util.erl
++++ b/deps/riak_ensemble/src/riak_ensemble_util.erl
+@@ -89,7 +89,7 @@ sha(Bin) ->
+ 
+ -spec md5(iolist() | binary()) -> binary().
+ md5(Bin) ->
+-    crypto:hash(md5, Bin).
++    erlang:md5(Bin).
+ 
+ -else.
+ 
+@@ -99,7 +99,7 @@ sha(Bin) ->
+ 
+ -spec md5(iolist() | binary()) -> binary().
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ 
+ -endif.
+ 
+diff --git a/deps/riak_ensemble/src/synctree.erl b/deps/riak_ensemble/src/synctree.erl
+index ee133f2..5f2b315 100644
+--- a/deps/riak_ensemble/src/synctree.erl
++++ b/deps/riak_ensemble/src/synctree.erl
+@@ -249,13 +249,13 @@ corrupt(Key, Tree=#tree{height=Height}) ->
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ 
+ get_segment(Key, #tree{segments=Segments}) ->
+-    <<HashKey:128/integer>> = crypto:hash(md5, ensure_binary(Key)),
++    <<HashKey:128/integer>> = erlang:md5(ensure_binary(Key)),
+     HashKey rem Segments.
+ 
+ -spec hash([{_, binary()}]) -> hash().
+ hash(Term) ->
+     L = [H || {_,H} <- Term],
+-    HashBin = crypto:hash(md5, L),
++    HashBin = erlang:md5(L),
+     <<?H_MD5, HashBin/binary>>.
+ 
+ ensure_binary(Key) when is_integer(Key) ->
+diff --git a/deps/riak_kv/src/riak_kv_util.erl b/deps/riak_kv/src/riak_kv_util.erl
+index c9f5d00..b07f4ae 100644
+--- a/deps/riak_kv/src/riak_kv_util.erl
++++ b/deps/riak_kv/src/riak_kv_util.erl
+@@ -368,10 +368,10 @@ mark_indexes_reformatted(_Idx, _ErrorCount, _ForUpgrade) ->
+ 
+ -ifndef(old_hash).
+ md5(Bin) ->
+-    crypto:hash(md5, Bin).
++    erlang:md5(Bin).
+ -else.
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ -endif.
+ 
+ %% @doc vtag creation function
 diff --git a/deps/riak_kv/src/riak_kv_wm_object.erl b/deps/riak_kv/src/riak_kv_wm_object.erl
-index 4d28fc0..a54984f 100644
+index fcd8e99..96e9fd3 100644
 --- a/deps/riak_kv/src/riak_kv_wm_object.erl
 +++ b/deps/riak_kv/src/riak_kv_wm_object.erl
-@@ -912,7 +912,7 @@ generate_etag(RD, Ctx) ->
-             {dict:fetch(?MD_VTAG, MD), RD, Ctx};
-         multiple_choices ->
-             {ok, Doc} = Ctx#ctx.doc,
--            <<ETag:128/integer>> = crypto:md5(term_to_binary(riak_object:vclock(Doc))),
-+            <<ETag:128/integer>> = erlang:md5(term_to_binary(riak_object:vclock(Doc))),
-             {riak_core_util:integer_to_list(ETag, 62), RD, Ctx}
-     end.
+@@ -1024,10 +1024,10 @@ delete_resource(RD, Ctx=#ctx{bucket_type=T, bucket=B, key=K, client=C}) ->
  
+ -ifndef(old_hash).
+ md5(Bin) ->
+-    crypto:hash(md5, Bin).
++    erlang:md5(Bin).
+ -else.
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ -endif.
+ 
+ -spec generate_etag(#wm_reqdata{}, context()) ->
 diff --git a/deps/webmachine/src/webmachine_decision_core.erl b/deps/webmachine/src/webmachine_decision_core.erl
-index 194c48d..fb81046 100644
+index ec15758..e7a09f4 100644
 --- a/deps/webmachine/src/webmachine_decision_core.erl
 +++ b/deps/webmachine/src/webmachine_decision_core.erl
-@@ -736,16 +736,16 @@ md5_final(Ctx) ->
-     crypto:hash_final(Ctx).
+@@ -740,28 +740,28 @@ variances() ->
+ 
+ -ifndef(old_hash).
+ md5(Bin) ->
+-    crypto:hash(md5, Bin).
++    erlang:md5(Bin).
+ 
+ md5_init() ->
+-    crypto:hash_init(md5).
++    erlang:md5_init().
+ 
+ md5_update(Ctx, Bin) ->
+-    crypto:hash_update(Ctx, Bin).
++    erlang:md5_update(Ctx, Bin).
+ 
+ md5_final(Ctx) ->
+-    crypto:hash_final(Ctx).
++    erlang:md5_final(Ctx).
  -else.
  md5(Bin) ->
 -    crypto:md5(Bin).
@@ -62,3 +170,42 @@ index 194c48d..fb81046 100644
  -endif.
  
  
+diff --git a/deps/webmachine/test/decision_core_test.erl b/deps/webmachine/test/decision_core_test.erl
+index 44fd0ee..6f454dc 100644
+--- a/deps/webmachine/test/decision_core_test.erl
++++ b/deps/webmachine/test/decision_core_test.erl
+@@ -29,10 +29,10 @@
+ 
+ -ifndef(old_hash).
+ md5(Bin) ->
+-    crypto:hash(md5,Bin).
++    erlang:md5(Bin).
+ -else.
+ md5(Bin) ->
+-    crypto:md5(Bin).
++    erlang:md5(Bin).
+ -endif.
+ 
+ -define(HTTP_1_0_METHODS, ['GET', 'POST', 'HEAD']).
+diff --git a/deps/mochiweb/src/mochiweb_session.erl b/deps/mochiweb/src/mochiweb_session.erl
+index d15ffe7..c385f4a 100644
+--- a/deps/mochiweb/src/mochiweb_session.erl
++++ b/deps/mochiweb/src/mochiweb_session.erl
+@@ -113,7 +113,7 @@ decrypt_data(<<IV:16/binary, Crypt/binary>>, Key) ->
+ 
+ -spec gen_key(iolist(), iolist()) -> binary().
+ gen_key(ExpirationTime, ServerKey)->
+-    crypto:md5_mac(ServerKey, [ExpirationTime]).
++    crypto:sha_mac(ServerKey, [ExpirationTime]).
+ 
+ -spec gen_hmac(iolist(), binary(), iolist(), binary()) -> binary().
+ gen_hmac(ExpirationTime, Data, SessionKey, Key) ->
+@@ -132,7 +132,7 @@ decrypt_data(<<IV:16/binary, Crypt/binary>>, Key) ->
+ 
+ -spec gen_key(iolist(), iolist()) -> binary().
+ gen_key(ExpirationTime, ServerKey)->
+-    crypto:hmac(md5, ServerKey, [ExpirationTime]).
++    crypto:hmac(sha, ServerKey, [ExpirationTime]).
+ 
+ -spec gen_hmac(iolist(), binary(), iolist(), binary()) -> binary().
+ gen_hmac(ExpirationTime, Data, SessionKey, Key) ->
