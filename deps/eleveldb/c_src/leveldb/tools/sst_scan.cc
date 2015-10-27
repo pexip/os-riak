@@ -12,6 +12,7 @@
 #include "table/format.h"
 #include "table/block.h"
 #include "table/filter_block.h"
+#include "util/cache2.h"
 
 //#include "util/logging.h"
 //#include "db/log_reader.h"
@@ -24,7 +25,7 @@ main(
     char ** argv)
 {
     bool error_seen, index_keys, all_keys, block_info, csv_header, counter_info,
-        running, no_csv;
+        running, no_csv, summary_only;
     int counter, error_counter;
     char ** cursor;
 
@@ -37,6 +38,8 @@ main(
     csv_header=false;
     all_keys=false;
     no_csv=false;
+    summary_only=false;
+
     counter=0;
     error_counter=0;
 
@@ -57,6 +60,7 @@ main(
                 case 'i':  index_keys=true; break;
                 case 'k':  all_keys=true; break;
                 case 'n':  no_csv=true; break;
+                case 's':  summary_only=true; break;
                 default:
                     fprintf(stderr, " option \'%c\' is not valid\n", flag);
                     command_help();
@@ -71,6 +75,7 @@ main(
         else
         {
             leveldb::Options options;
+            leveldb::DoubleCache double_cache(options);
             leveldb::ReadOptions read_options;
             std::string table_name, dbname, path_temp;
             leveldb::Env * env;
@@ -79,18 +84,19 @@ main(
             env=leveldb::Env::Default();
 
             const int search_level = -2;
-            const bool is_overlapped = search_level < 3; // temporary: see TableCache::Evict() 
+            const bool is_overlapped = search_level < 3; // temporary: see TableCache::Evict()
 
             // make copy since basename() and dirname() may modify
             path_temp=*cursor;
             dbname=dirname((char *)path_temp.c_str());
+            dbname=MakeTieredDbname(dbname, options);
             path_temp=*cursor;
             table_name=basename((char *)path_temp.c_str());
             meta.number=strtol(table_name.c_str(), NULL, 10);
 
             options.filter_policy=leveldb::NewBloomFilterPolicy(10);
-            table_cache=new leveldb::TableCache(dbname, &options, 10);
-            table_name = leveldb::TableFileName(dbname, meta.number, search_level);
+            table_cache=new leveldb::TableCache(dbname, &options, double_cache.GetFileCache(), double_cache);
+            table_name = leveldb::TableFileName(options, meta.number, search_level);
 
             // open table, step 1 get file size
             leveldb::Status status = env->GetFileSize(table_name, &meta.file_size);
@@ -160,7 +166,7 @@ main(
                     tot_compress=0;
                     tot_uncompress=0;
 
-                    for (it->SeekToFirst(), count=0; it->Valid(); it->Next())
+                    for (it->SeekToFirst(), count=0; it->Valid() && !summary_only; it->Next())
                     {
                         leveldb::BlockContents contents;
                         leveldb::BlockHandle bhandle;
@@ -203,7 +209,7 @@ main(
                     }   // for
 
                     // Walk all keys in each block.
-                    for (it->SeekToFirst(), count=0; it->Valid(); it->Next())
+                    for (it->SeekToFirst(), count=0; it->Valid() && !summary_only; it->Next())
                     {
                         ++count;
                         it2=leveldb::Table::TEST_BlockReader(table, read_options, it->value());
@@ -264,13 +270,13 @@ main(
                                table_name.c_str(), meta.file_size, table->TEST_GetIndexBlock()->size(), count);
 
                         printf(" %d, %zd, %zd, %zd, %zd,",
-                               total, tot_size, (0!=count2) ? tot_size/total : 0, smallest_block,
-                               (tot_uncompress*100)/tot_compress);
+                               total, tot_size, (0!=total) ? tot_size/total : 0, smallest_block,
+                               (0!=tot_compress) ? (tot_uncompress*100)/tot_compress: 0);
 
                         printf(" %zd, %zd",
                                table->TEST_TableObjectSize(), table->TEST_FilterDataSize());
 
-                        if (counter_info)
+                        if (counter_info || summary_only)
                         {
                             unsigned loop;
                             leveldb::SstCounters counters;

@@ -50,11 +50,17 @@
 -type from() :: {atom(), req_id(), pid()}.
 -type req_id() :: non_neg_integer().
 
+-ifdef(namespaced_types).
+-type riak_kv_index_fsm_dict() :: dict:dict().
+-else.
+-type riak_kv_index_fsm_dict() :: dict().
+-endif.
+
 -record(state, {from :: from(),
                 pagination_sort :: boolean(),
                 merge_sort_buffer = undefined :: sms:sms() | undefined,
                 max_results :: all | pos_integer(),
-                results_per_vnode = dict:new() :: dict(),
+                results_per_vnode = dict:new() :: riak_kv_index_fsm_dict(),
                 results_sent = 0 :: non_neg_integer()}).
 
 %% @doc Returns `true' if the new ack-based backpressure index
@@ -124,14 +130,14 @@ process_results(VNode, {From, Bucket, Results}, State) ->
             VNodeCount = dict:fetch(VNode, PerNode),
             case VNodeCount < MaxResults of
                 true ->
-                    riak_kv_vnode:ack_keys(From),
+                    _ = riak_kv_vnode:ack_keys(From),
                     {ok, State2};
                 false ->
                     riak_kv_vnode:stop_fold(From),
                     {done, State2}
             end;
         {ok, State2} ->
-            riak_kv_vnode:ack_keys(From),
+            _ = riak_kv_vnode:ack_keys(From),
             {ok, State2};
         {done, State2} ->
             riak_kv_vnode:stop_fold(From),
@@ -188,7 +194,7 @@ process_results({error, Reason}, _State) ->
 process_results({From, Bucket, Results},
                 StateData=#state{from={raw, ReqId, ClientPid}}) ->
     process_query_results(Bucket, Results, ReqId, ClientPid),
-    riak_kv_vnode:ack_keys(From), % tell that vnode we're ready for more
+    _ = riak_kv_vnode:ack_keys(From), % tell that vnode we're ready for more
     {ok, StateData};
 process_results({Bucket, Results},
                 StateData=#state{from={raw, ReqId, ClientPid}}) ->

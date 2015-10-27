@@ -11,14 +11,15 @@
 -export([new/3, get_header_value/2, get/2, dump/1]).
 -export([send/2, write_chunk/2]).
 
-%% @type response(). A mochiweb_response parameterized module instance.
+%% @type response() = {atom(), [Request, Code, Headers]}
 
 %% @spec new(Request, Code, Headers) -> response()
 %% @doc Create a new mochiweb_response instance.
 new(Request, Code, Headers) ->
     {?MODULE, [Request, Code, Headers]}.
 
-%% @spec get_header_value(string() | atom() | binary(), response()) -> string() | undefined
+%% @spec get_header_value(string() | atom() | binary(), response()) ->
+%%           string() | undefined
 %% @doc Get the value of the given response header.
 get_header_value(K, {?MODULE, [_Request, _Code, Headers]}) ->
     mochiweb_headers:get_value(K, Headers).
@@ -54,7 +55,7 @@ send(Data, {?MODULE, [Request, _Code, _Headers]}) ->
 %% @doc Write a chunk of a HTTP chunked response. If Data is zero length,
 %%      then the chunked response will be finished.
 write_chunk(Data, {?MODULE, [Request, _Code, _Headers]}=THIS) ->
-    case Request:get(version) of
+    case Request:get(version, THIS) of
         Version when Version >= {1, 1} ->
             Length = iolist_size(Data),
             send([io_lib:format("~.16b\r\n", [Length]), Data, <<"\r\n">>], THIS);

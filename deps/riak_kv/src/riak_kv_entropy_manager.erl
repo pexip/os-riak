@@ -78,7 +78,7 @@
 -define(DEFAULT_CONCURRENCY, 2).
 -define(DEFAULT_BUILD_LIMIT, {1, 3600000}). %% Once per hour
 -define(AAE_THROTTLE_ENV_KEY, aae_throttle_sleep_time).
--define(AAE_THROTTLE_KILL_ENV_KEY, aae_throttle_kill).
+-define(AAE_THROTTLE_KILL_ENV_KEY, aae_throttle_kill_switch).
 
 %%%===================================================================
 %%% API
@@ -203,8 +203,23 @@ cancel_exchanges() ->
 init([]) ->
     %% Side-effects section
     set_aae_throttle(0),
-    set_aae_throttle_limits(
-      [{-1, 0}, {200, 10}, {500, 50}, {750, 250}, {900, 1000}, {1100, 5000}]),
+    %% riak_kv.app has some sane limits already set, or config via Cuttlefish
+    %% If the value is not sane, the pattern match below will fail.
+    Limits = case app_helper:get_env(riak_kv, aae_throttle_limits, []) of
+                 [] ->
+                     [{-1,0}, {200,10}, {500,50}, {750,250}, {900,1000}, {1100,5000}];
+                 OtherLs ->
+                     OtherLs
+             end,
+    case set_aae_throttle_limits(Limits) of
+        ok ->
+            ok;
+        {error, DiagProps} ->
+            _ = [lager:error("aae_throttle_limits/anti_entropy.throttle.limits "
+                         "list fails this test: ~p\n", [Check]) ||
+                {Check, false} <- DiagProps],
+            error(invalid_aae_throttle_limits)
+    end,
     schedule_tick(),
 
     {_, Opts} = settings(),
@@ -225,8 +240,15 @@ init([]) ->
     schedule_reset_build_tokens(),
     {ok, State2}.
 
-handle_call({set_mode, Mode}, _From, State) ->
-    {reply, ok, State#state{mode=Mode}};
+handle_call({set_mode, Mode}, _From, State=#state{mode=CurrentMode}) ->
+    State2 = case {CurrentMode, Mode} of
+                 {automatic, manual} ->
+                     %% Clear exchange queue when switching to manual mode
+                     State#state{exchange_queue=[]};
+                 _ ->
+                     State
+             end,
+    {reply, ok, State2#state{mode=Mode}};
 handle_call({manual_exchange, Exchange}, _From, State) ->
     State2 = enqueue_exchange(Exchange, State),
     {reply, ok, State2};
@@ -237,7 +259,7 @@ handle_call(enable, _From, State) ->
 handle_call(disable, _From, State) ->
     {_, Opts} = settings(),
     application:set_env(riak_kv, anti_entropy, {off, Opts}),
-    [riak_kv_index_hashtree:stop(T) || {_,T} <- State#state.trees],
+    _ = [riak_kv_index_hashtree:stop(T) || {_,T} <- State#state.trees],
     {reply, ok, State};
 handle_call({get_lock, Type, Pid}, _From, State) ->
     {Reply, State2} = do_get_lock(Type, Pid, State),
@@ -287,9 +309,8 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(tick, State) ->
-    State1 = query_and_set_aae_throttle(State),
-    State2 = maybe_tick(State1),
-    {noreply, State2};
+    State1 = maybe_tick(State),
+    {noreply, State1};
 handle_info(reset_build_tokens, State) ->
     State2 = reset_build_tokens(State),
     schedule_reset_build_tokens(),
@@ -370,7 +391,7 @@ reload_hashtrees(Ring, State=#state{trees=Trees}) ->
     Existing = dict:from_list(Trees),
     MissingIdx = [Idx || Idx <- Indices,
                          not dict:is_key(Idx, Existing)],
-    [riak_kv_vnode:request_hashtree_pid(Idx) || Idx <- MissingIdx],
+    _ = [riak_kv_vnode:request_hashtree_pid(Idx) || Idx <- MissingIdx],
     State.
 
 add_hashtree_pid(Index, Pid, State) ->
@@ -477,7 +498,7 @@ maybe_tick(State) ->
         false ->
             %% Ensure we do not have any running index_hashtrees, which can
             %% happen when disabling anti-entropy on a live system.
-            [riak_kv_index_hashtree:stop(T) || {_,T} <- State#state.trees],
+            _ = [riak_kv_index_hashtree:stop(T) || {_,T} <- State#state.trees],
             NextState = State
     end,
     schedule_tick(),
@@ -486,7 +507,8 @@ maybe_tick(State) ->
 -spec tick(state()) -> state().
 tick(State) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-    State2 = maybe_reload_hashtrees(Ring, State),
+    State1 = query_and_set_aae_throttle(State),
+    State2 = maybe_reload_hashtrees(Ring, State1),
     State3 = lists:foldl(fun(_,S) ->
                                  maybe_poke_tree(S)
                          end, State2, lists:seq(1,10)),
@@ -533,7 +555,7 @@ enqueue_exchange(E={Index, _RemoteIdx, _IndexN}, State) ->
         false ->
             State
     end;
-enqueue_exchange({Index, IndexN}, State) -> 
+enqueue_exchange({Index, IndexN}, State) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     Exchanges = all_pairwise_exchanges(Index, Ring),
     Exchanges2 = [Exchange || Exchange={_, _, IdxN} <- Exchanges,
@@ -738,7 +760,11 @@ set_aae_throttle_kill(Bool) when Bool == true; Bool == false ->
 
 get_max_local_vnodeq() ->
     try
-        {element(2,lists:keyfind(riak_kv_vnodeq_max, 1, riak_core_stat:get_stats())), node()}
+	{ok, [{max,M}]} =
+	    exometer:get_value(
+	      [riak_core_stat:prefix(),riak_core,vnodeq,riak_kv_vnode],
+	      [max]),
+	{M, node()}
     catch _X:_Y ->
             %% This can fail locally if riak_core & riak_kv haven't finished their setup.
             {0, node()}
@@ -764,8 +790,9 @@ set_aae_throttle_limits(Limits) ->
             lager:info("Setting AAE throttle limits: ~p\n", [Limits]),
             application:set_env(riak_kv, aae_throttle_limits, Limits),
             ok;
-        Else ->
-            {error, Else}
+        {Else1, Else2} ->
+            {error, [{negative_one_length_is_present, Else1},
+                     {all_sleep_times_are_non_negative_integers, Else2}]}
     end.
 
 query_and_set_aae_throttle(#state{last_throttle=LastThrottle} = State) ->

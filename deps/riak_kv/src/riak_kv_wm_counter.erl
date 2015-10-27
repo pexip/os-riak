@@ -24,12 +24,14 @@
 %%
 %% Available operations:
 %%
-%% POST /buckets/Bucket/counters/Key
+%% `POST /buckets/Bucket/counters/Key'
+%%
 %%   Increment the counter at `Bucket', `Key' by
 %%   the integer amount of the request body. If the request body cannot be
-%%   parsed (by erlang `list_to_integer/1') then a `400 bad request'
+%%   parsed (by Erlang's `list_to_integer/1') then a `400 bad request'
 %%   is the result.
-%%   The following query params are accepted (@see `riak_kv_wm_object' docs, too):
+%%
+%%   The following query params are accepted (see {@link riak_kv_wm_object} docs, too):
 %%
 %%   <dl>
 %%     <dt>w</dt><dd>The write quorum. See below for defaults and values.</dd>
@@ -39,9 +41,11 @@
 %%                             the response body will be the value of the counter.</dd>
 %%   </dl>
 %%
-%%  GET /buckets/Bucket/counters/Key
+%%  `GET /buckets/Bucket/counters/Key'
+%%
 %%    Get the current value of the counter at `Bucket', `Key'. Result is a text/plain
 %%    body with an integer value, or `not_found' if no counter exists at that resource location.
+%%
 %%    The following query params are accepted:
 %%
 %%    <dl>
@@ -53,16 +57,16 @@
 %%                              `r' quorum if true. Default is the bucket default, if absent.</dd>
 %%    </dl>
 %%
-%%   Quorum values (r/pr/w/pw/dw):
+%%   == Quorum values (r/pr/w/pw/dw) ==
 %%     <dl>
-%%       <dt>default</dt<dd>Whatever the bucket default is. This is the value used
+%%       <dt>default</dt><dd>Whatever the bucket default is. This is the value used
 %%                          for any absent value.</dd>
 %%      <dt>quorum</dt><dd>(Bucket N val / 2) + 1</dd>
 %%      <dt>all</dt><dd>All replicas must respond</dd>
 %%      <dt>one</dt><dd>Any one response is enough</dd>
-%%      <dt>Integer</dt><dd>That specific number of vnodes must respond. Must be =< N</dd>
+%%      <dt>Integer</dt><dd>That specific number of vnodes must respond. Must be `=<' N</dd>
 %%    </dl>
-%% Please see http://docs.basho.com for details of all the quorum values and there effect.
+%% Please see [http://docs.basho.com] for details of all the quorum values and there effect.
 
 
 
@@ -72,6 +76,7 @@
 -export([
          init/1,
          service_available/2,
+         is_authorized/2,
          forbidden/2,
          allowed_methods/2,
          malformed_request/2,
@@ -82,10 +87,7 @@
          accept_doc_body/2,
          to_text/2
         ]).
-%% The empty counter that is the body of all new counter objects
--define(NEW_COUNTER, {riak_kv_pncounter, riak_kv_pncounter:new()}).
 
-%% @type context() = term()
 -record(ctx, {api_version,  %% integer() - Determine which version of the API to use.
               bucket,       %% binary() - Bucket name (from uri)
               key,          %% binary() - Key (from uri)
@@ -103,15 +105,17 @@
               doc,          %% {ok, riak_object()}|{error, term()} - the object found
               bucketprops,  %% proplist() - properties of the bucket
               method,       %% atom() - HTTP method for the request
-              counter_op    :: integer() | undefined %% The amount to add to the counter
+              counter_op    :: integer() | undefined, %% The amount to add to the counter
+              security      %% security context
              }).
-%% @type link() = {{Bucket::binary(), Key::binary()}, Tag::binary()}
-%% @type index_field() = {Key::string(), Value::string()}
+-type context() :: #ctx{}.
 
 -include_lib("webmachine/include/webmachine.hrl").
 -include("riak_kv_wm_raw.hrl").
+-include("riak_kv_types.hrl").
 
-%% @spec init(proplist()) -> {ok, context()}
+
+-spec init(proplists:proplist()) -> {ok, context()}.
 %% @doc Initialize this resource.  This function extracts the
 %%      'prefix' and 'riak' properties from the dispatch args.
 init(Props) ->
@@ -120,7 +124,7 @@ init(Props) ->
               riak=proplists:get_value(riak, Props)}}.
 
 service_available(RD, Ctx=#ctx{riak=RiakProps}) ->
-    case riak_kv_counter:supported() of
+    case lists:member(pncounter, riak_core_capability:get({riak_kv, crdt}, [])) of
         true ->
             case riak_kv_wm_utils:get_riak_client(RiakProps, riak_kv_wm_utils:get_client_id(RD)) of
                 {ok, C} ->
@@ -152,8 +156,47 @@ service_available(RD, Ctx=#ctx{riak=RiakProps}) ->
              Ctx}
     end.
 
-forbidden(RD, Ctx) ->
-    {riak_kv_wm_utils:is_forbidden(RD), RD, Ctx}.
+is_authorized(ReqData, Ctx) ->
+    case riak_api_web_security:is_authorized(ReqData) of
+        false ->
+            {"Basic realm=\"Riak\"", ReqData, Ctx};
+        {true, SecContext} ->
+            {true, ReqData, Ctx#ctx{security=SecContext}};
+        insecure ->
+            %% XXX 301 may be more appropriate here, but since the http and
+            %% https port are different and configurable, it is hard to figure
+            %% out the redirect URL to serve.
+            {{halt, 426}, wrq:append_to_resp_body(<<"Security is enabled and "
+                    "Riak does not accept credentials over HTTP. Try HTTPS "
+                    "instead.">>, ReqData), Ctx}
+    end.
+
+forbidden(RD, Ctx=#ctx{security = undefined}) ->
+    {riak_kv_wm_utils:is_forbidden(RD), RD, Ctx};
+forbidden(RD, Ctx=#ctx{security=Security}) ->
+    case riak_kv_wm_utils:is_forbidden(RD) of
+        true ->
+            {true, RD, Ctx};
+        false ->
+            Perm = case Ctx#ctx.method of
+                'POST' ->
+                    "riak_kv.put";
+                'GET' ->
+                    "riak_kv.get"
+            end,
+
+            Res = riak_core_security:check_permission({Perm,
+                                                           {<<"default">>,
+                                                            Ctx#ctx.bucket}},
+                                                           Security),
+            case Res of
+                {false, Error, _} ->
+                    RD1 = wrq:set_resp_header("Content-Type", "text/plain", RD),
+                    {true, wrq:append_to_resp_body(unicode:characters_to_binary(Error, utf8, utf8), RD1), Ctx};
+                {true, _} ->
+                    {false, RD, Ctx}
+            end
+    end.
 
 allowed_methods(RD, Ctx) ->
     {['GET', 'POST'], RD, Ctx}.
@@ -261,9 +304,10 @@ accept_doc_body(RD, Ctx=#ctx{bucket=B, key=K, client=C,
                             counter_op=CounterOp}) ->
     case allow_mult(B) of
         true ->
-            Doc = riak_kv_counter:new(B, K),
+            Doc = riak_kv_crdt:new(B, K, ?V1_COUNTER_TYPE),
             Options = [{counter_op, CounterOp}] ++ return_value(RD),
-            case C:put(Doc, [{w, Ctx#ctx.w}, {dw, Ctx#ctx.dw}, {pw, Ctx#ctx.pw}, {timeout, 60000} |
+            case C:put(Doc, [{w, Ctx#ctx.w}, {dw, Ctx#ctx.dw}, {pw, Ctx#ctx.pw},
+                             {timeout, 60000}, {retry_put_coordinator_failure, false} |
                                    Options]) of
                 {error, Reason} ->
                     handle_common_error(Reason, RD, Ctx);
@@ -292,7 +336,7 @@ to_text(RD, Ctx=#ctx{doc={ok, Doc}}) ->
     {produce_doc_body(Doc), RD, Ctx}.
 
 produce_doc_body(Doc) ->
-    Value = riak_kv_counter:value(Doc),
+    {{_Ctx, Value},_} = riak_kv_crdt:value(Doc, ?V1_COUNTER_TYPE),
     integer_to_list(Value).
 
 ensure_doc(Ctx=#ctx{doc=undefined, key=undefined}) ->

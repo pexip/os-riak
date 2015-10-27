@@ -17,6 +17,9 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
+%%
+%% @doc Server responsible for tracking state of the Riak cluster and
+%%      refreshing state on a particular interval.
 
 -module(riak_control_session).
 
@@ -26,7 +29,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--include_lib("riak_control/include/riak_control.hrl").
+-include("riak_control.hrl").
 
 %% API
 -export([start_link/0,
@@ -37,6 +40,8 @@
          get_partitions/0,
          get_status/0,
          get_plan/0,
+         get_n_vals/0,
+         get_default_n_val/0,
          clear_plan/0,
          stage_change/3,
          commit_plan/0,
@@ -53,12 +58,15 @@
 %% exported for RPC calls.
 -export([get_my_info/0]).
 
--record(state, {vsn         :: version(),
-                services    :: services(),
-                ring        :: ring(),
-                partitions  :: partitions(),
-                nodes       :: members(),
-                update_tick :: boolean()}).
+-record(state, {vsn           :: version(),
+                services      :: services(),
+                ring          :: ring(),
+                partitions    :: partitions(),
+                nodes         :: members(),
+                update_tick   :: boolean(),
+                transfers     :: transfers(),
+                n_vals        :: n_vals(),
+                default_n_val :: pos_integer()}).
 
 -type normalized_action() :: leave
                            | remove
@@ -67,10 +75,10 @@
                            | stop
                            | down.
 
-%% @doc Periodically update the ring with itself
+%% Periodically update the ring with itself
 -define(INTERVAL, 3000).
 
-%% @doc Delay used after a ring update
+%% Delay used after a ring update
 -define(UPDATE_TICK_TIMEOUT, 1000).
 
 %% ===================================================================
@@ -112,6 +120,16 @@ get_services() ->
 get_partitions() ->
     gen_server:call(?MODULE, get_partitions, infinity).
 
+%% @doc Return list of available n_vals.
+-spec get_n_vals() -> {ok, version(), n_vals()}.
+get_n_vals() ->
+    gen_server:call(?MODULE, get_n_vals, infinity).
+
+%% @doc Return list of available n_vals.
+-spec get_default_n_val() -> {ok, version(), pos_integer()}.
+get_default_n_val() ->
+    gen_server:call(?MODULE, get_default_n_val, infinity).
+
 %% @doc Get the staged cluster plan.
 -spec get_plan() -> {ok, list(), list()} | {error, atom()}.
 get_plan() ->
@@ -130,7 +148,7 @@ commit_plan() ->
     gen_server:call(?MODULE, commit_plan, infinity).
 
 %% @doc Clear the staged cluster plan.
--spec clear_plan() -> {ok, ok | error}.
+-spec clear_plan() -> ok | error.
 clear_plan() ->
     gen_server:call(?MODULE, clear_plan, infinity).
 
@@ -166,22 +184,24 @@ init([]) ->
 
     %% the initial state of the session
     State=#state{vsn=1,
-                 partitions=[],
                  nodes=[],
                  services=[],
+                 transfers=[],
+                 partitions=[],
                  update_tick=false},
 
     %% start the server
     {ok, update_ring(State, Ring)}.
 
+handle_call(get_plan, _From, State) ->
+    {reply, retrieve_plan(), State};
+handle_call(clear_plan, _From, State) ->
+    {reply, maybe_clear_plan(), State};
 handle_call(commit_plan, _From, State) ->
     {reply, maybe_commit_plan(), State};
 handle_call({stage_change, Node, Action, Replacement}, _From, State) ->
     {reply, maybe_stage_change(Node, Action, Replacement), State};
-handle_call(clear_plan, _From, State) ->
-    {reply, {ok, maybe_clear_plan()}, State};
-handle_call(get_plan, _From, State) ->
-    {reply, retrieve_plan(), State};
+
 handle_call(get_version, _From, State=#state{vsn=V}) ->
     {reply, {ok, V}, State};
 handle_call(get_status, _From, State=#state{vsn=V,nodes=N}) ->
@@ -194,7 +214,11 @@ handle_call(get_nodes, _From, State=#state{vsn=V,nodes=N}) ->
 handle_call(get_services, _From, State=#state{vsn=V,services=S}) ->
     {reply, {ok, V, S}, State};
 handle_call(get_partitions, _From, State=#state{vsn=V,partitions=P}) ->
-    {reply, {ok, V, P}, State}.
+    {reply, {ok, V, P}, State};
+handle_call(get_n_vals, _From, State=#state{vsn=V,n_vals=N}) ->
+    {reply, {ok, V, N}, State};
+handle_call(get_default_n_val, _From, State=#state{vsn=V,default_n_val=N}) ->
+    {reply, {ok, V, N}, State}.
 
 %% @doc
 %%
@@ -208,8 +232,10 @@ handle_call(get_partitions, _From, State=#state{vsn=V,partitions=P}) ->
 %% @end
 handle_cast({update_ring, Ring}, State=#state{update_tick=Tick}) ->
     case Tick of
-        false -> {noreply,update_ring(State,Ring)};
-        true -> {noreply,State}
+        false ->
+            {noreply, update_ring(State,Ring)};
+        true ->
+            {noreply, State}
     end;
 handle_cast(update_ring,State) ->
     {ok, Ring}=riak_core_ring_manager:get_my_ring(),
@@ -257,13 +283,22 @@ update_services(State=#state{services=S}, Services) ->
     NewState = update_partitions(NodeState),
     rev_state(NewState).
 
+%% @doc Update list of all available nvals.
+-spec update_n_vals(#state{}) -> #state{}.
+update_n_vals(State=#state{ring=Ring}) ->
+    DefaultNVal = riak_control_ring:n_val(),
+    Unique = lists:usort([DefaultNVal |
+        [NVal || {_, NVal} <- riak_core_bucket:bucket_nval_map(Ring)]]),
+    State#state{n_vals=Unique, default_n_val=DefaultNVal}.
+
 %% @doc Update ring state and partitions.
 -spec update_ring(#state{}, ring()) -> #state{}.
 update_ring(State, Ring) ->
     erlang:send_after(?UPDATE_TICK_TIMEOUT, self(), clear_update_tick),
     NodeState = update_nodes(State#state{update_tick=true, ring=Ring}),
-    NewState = update_partitions(NodeState),
-    rev_state(NewState).
+    NValsAdded = update_n_vals(NodeState),
+    FinalState = update_partitions(NValsAdded),
+    rev_state(FinalState).
 
 %% @doc Update ring.
 -spec update_nodes(#state{}) -> #state{}.
@@ -274,10 +309,9 @@ update_nodes(State=#state{ring=Ring}) ->
 
 %% @doc Update partitions.
 -spec update_partitions(#state{}) -> #state{}.
-update_partitions(State=#state{ring=Ring}) ->
-    Owners = riak_core_ring:all_owners(Ring),
-    Handoffs = get_all_handoffs(State),
-    Partitions = [get_partition_details(State, Owner, Handoffs) || Owner <- Owners],
+update_partitions(State=#state{ring=Ring, nodes=Nodes, n_vals=NVals}) ->
+    Unavailable = [Name || ?MEMBER_INFO{node=Name, reachable=false} <- Nodes],
+    Partitions = [[{n_val, NVal}, {partitions, riak_control_ring:status(Ring, NVal, Unavailable)}] || NVal <- NVals],
     State#state{partitions=Partitions}.
 
 %% @doc Ping and retrieve vnode workers.
@@ -292,7 +326,7 @@ get_member_info(_Member={Node, Status}, Ring) ->
     PctPending = length(FutureIndices) / RingSize,
 
     %% try and get a list of all the vnodes running on the node
-    case rpc:call(Node, riak_control_session, get_my_info, []) of
+    try rpc:call(Node, riak_control_session, get_my_info, []) of
         {badrpc,nodedown} ->
             ?MEMBER_INFO{node = Node,
                          status = Status,
@@ -325,6 +359,16 @@ get_member_info(_Member={Node, Status}, Ring) ->
             ?MEMBER_INFO{node = Node,
                          status = incompatible,
                          reachable = true,
+                         vnodes = [],
+                         handoffs = [],
+                         ring_pct = PctRing,
+                         pending_pct = PctPending}
+    catch
+        exit:R ->
+            lager:warning("rpc:call(~p, riak_control_session, get_my_info, []) failed with reason: ~p", [Node, R]),
+            ?MEMBER_INFO{node = Node,
+                         status = Status,
+                         reachable = false,
                          vnodes = [],
                          handoffs = [],
                          ring_pct = PctRing,
@@ -397,40 +441,6 @@ get_handoff_status() ->
     Transfers = riak_core_handoff_manager:status({direction, outbound}),
     [format_transfer(Transfer) || Transfer <- lists:flatten(Transfers)].
 
-%% @doc Get handoffs for every node.
--spec get_all_handoffs(#state{}) -> handoffs().
-get_all_handoffs(#state{nodes=Members}) ->
-    lists:flatten([HS || ?MEMBER_INFO{handoffs=HS} <- Members]).
-
-%% @doc Get information for a particular index.
--spec get_partition_details(#state{}, {integer(), term()}, handoffs())
-    -> #partition_info{}.
-get_partition_details(#state{services=Services, ring=Ring}, {Idx, Owner}, HS) ->
-    Statuses = [get_vnode_status(Service, Ring, Idx) || Service <- Services],
-    Handoffs = [{Mod, Node} || {Mod, I, Node} <- HS, I == Idx],
-    #partition_info{index = Idx,
-                    partition = partition_index(Ring,Idx),
-                    owner = Owner,
-                    vnodes = Statuses,
-                    handoffs = Handoffs}.
-
-%% @doc Given a partition index, return.
--spec partition_index(ring(), integer()) -> term().
-partition_index(Ring, Index) ->
-    NumPartitions = riak_core_ring:num_partitions(Ring),
-    Index div chash:ring_increment(NumPartitions).
-
-%% @doc Return current vnode status.
--spec get_vnode_status(term(), term(), integer()) -> {service(), home()}.
-get_vnode_status(Service, Ring, Index) ->
-    UpNodes = riak_core_node_watcher:nodes(Service),
-    case riak_core_apl:get_apl_ann(<<(Index-1):160>>, 1, Ring, UpNodes) of
-        [{{_, _}, Status}|_] ->
-            {Service, Status};
-        [] ->
-            {Service, undefined}
-    end.
-
 %% @doc Attempt to clear the cluster plan.
 -spec maybe_clear_plan() -> ok | error.
 maybe_clear_plan() ->
@@ -490,7 +500,13 @@ maybe_stage_change(Node, Action, Replacement) ->
                 [_Me] ->
                     riak_core:staged_join(Node);
                 _ ->
-                    rpc:call(Node, riak_core, staged_join, [node()])
+                    try rpc:call(Node, riak_core, staged_join, [node()]) of
+                        X -> X
+                    catch
+                        exit:R ->
+                            lager:warning("rpc:call(~p, riak_core, staged_join, [~p]) failed with reason: ~p", [Node, node(), R]),
+                            {badrpc,nodedown}
+                    end
             end;
         leave ->
             riak_core_claimant:leave_member(Node);
@@ -503,7 +519,13 @@ maybe_stage_change(Node, Action, Replacement) ->
         down ->
             riak_core:down(Node);
         stop ->
-            rpc:call(Node, riak_core, stop, [])
+            try rpc:call(Node, riak_core, stop, []) of
+                X -> X
+            catch
+                exit:R ->
+                    lager:warning("rpc:call(~p, riak_core, stop, []) failed with reason: ~p", [Node, R]),
+                    {badrpc, nodedown}
+            end
     end.
 
 %% @doc Conditionally upgrade member info records once they cross node
@@ -547,7 +569,7 @@ handle_bad_record(Total, Used, ErlangMemory, VNodes, Handoffs) ->
 
 %% @doc Determine overall cluster status.
 %%      If the cluster is of one status, return it; default to valid.
-%%      If one or more nodes is incompatible, return incompatible, else 
+%%      If one or more nodes is incompatible, return incompatible, else
 %%      introduce a new state called transitioning.
 -spec determine_overall_status(members()) -> status().
 determine_overall_status(Nodes) ->

@@ -1,7 +1,7 @@
 {application, bitcask,
  [
   {description, ""},
-  {vsn, git},
+  {vsn, "1.7.0"},
   {modules, []},
   {registered, []},
   {applications, [
@@ -12,6 +12,8 @@
   {env, [
          %% Default max file size (in bytes)
          {max_file_size, 16#80000000}, % 2GB default
+
+         {tombstone_version, 2},
 
          %% Wait time to open a keydir (in seconds)
          {open_timeout, 4},
@@ -62,7 +64,6 @@
          {max_fold_age, -1},               % age in micro seconds (unlimited)
          {max_fold_puts, 0},               % maximum number of updates
 
-         %% Data expiration can be caused by setting this to a
          %% Data expiration can be caused by setting this to a
          %% positive value.  If so, items older than the value
          %% will be discarded.

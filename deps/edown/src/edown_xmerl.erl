@@ -1,5 +1,5 @@
 %%==============================================================================
-%% Copyright 2010 Erlang Solutions Ltd.
+%% Copyright 2014 Ulf Wiger
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 %% limitations under the License.
 %%==============================================================================
 %% @author Ulf Wiger <ulf@wiger.net>
-%% @copyright 2010 Erlang Solutions Ltd
+%% @copyright 2014 Ulf Wiger
 %% @end
 %% =============================================================================
 %% Modified 2012 by Beads Land-Trujillo:  '#text#'/1, brstrip/1
@@ -92,6 +92,8 @@ brstrip(Str) -> re:replace(Str, "\\s+\\s\$", "", [global, multiline, unicode]).
 	#xmlElement{attributes = Attrs1, parents = Parents1} = E1 ->
 	    elem(a, Data, Attrs1, Parents1, E1)
     end;
+'#element#'(br, _, _, _, _) ->
+    ["<br />"];
 '#element#'(Tag, Data, Attrs, Parents, E) ->
     elem(Tag, Data, Attrs, Parents, E).
 

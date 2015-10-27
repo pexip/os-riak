@@ -201,6 +201,7 @@ extern void leveldb_options_set_max_open_files(leveldb_options_t*, int);
 extern void leveldb_options_set_cache(leveldb_options_t*, leveldb_cache_t*);
 extern void leveldb_options_set_block_size(leveldb_options_t*, size_t);
 extern void leveldb_options_set_block_restart_interval(leveldb_options_t*, int);
+extern void leveldb_options_set_total_leveldb_mem(leveldb_options_t*, size_t);
 
 enum {
   leveldb_no_compression = 0,
@@ -269,6 +270,7 @@ extern void leveldb_cache_destroy(leveldb_cache_t* cache);
 
 extern leveldb_env_t* leveldb_create_default_env();
 extern void leveldb_env_destroy(leveldb_env_t*);
+extern void leveldb_env_shutdown();
 
 #ifdef __cplusplus
 }  /* end extern "C" */

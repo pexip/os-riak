@@ -22,8 +22,6 @@
 %% different riak_kv tasks asynchronously.
 
 -module(riak_kv_worker).
--author('Kelly McLaughlin <kelly@basho.com>').
-
 -behaviour(riak_core_vnode_worker).
 
 -export([init_worker/3,
@@ -47,7 +45,8 @@ handle_work({fold, FoldFun, FinishFun}, _Sender, State) ->
     try
         FinishFun(FoldFun())
     catch
-        receiver_down -> ok;
-        stop_fold -> ok
+        throw:receiver_down -> ok;
+        throw:stop_fold     -> ok;
+        throw:PrematureAcc  -> FinishFun(PrematureAcc)
     end,
     {noreply, State}.

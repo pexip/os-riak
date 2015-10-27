@@ -9,7 +9,7 @@
 
 -include("internal.hrl").
 
--export([start/1, stop/1]).
+-export([start/1, start_link/1, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2, code_change/3,
          handle_info/2]).
 -export([get/2, set/3]).
@@ -18,7 +18,6 @@
         {port,
          loop,
          name=undefined,
-         %% NOTE: This is currently ignored.
          max=2048,
          ip=any,
          listen=null,
@@ -33,10 +32,22 @@
 
 -define(is_old_state(State), not is_record(State, mochiweb_socket_server)).
 
-start(State=#mochiweb_socket_server{}) ->
-    start_server(State);
+start_link(Options) ->
+    start_server(start_link, parse_options(Options)).
+
 start(Options) ->
-    start(parse_options(Options)).
+    case lists:keytake(link, 1, Options) of
+        {value, {_Key, false}, Options1} ->
+            start_server(start, parse_options(Options1));
+        _ ->
+            %% TODO: https://github.com/mochi/mochiweb/issues/58
+            %%   [X] Phase 1: Add new APIs (Sep 2011)
+            %%   [_] Phase 2: Add deprecation warning
+            %%   [_] Phase 3: Change default to {link, false} and ignore link
+            %%   [_] Phase 4: Add deprecation warning for {link, _} option
+            %%   [_] Phase 5: Remove support for {link, _} option
+            start_link(Options)
+    end.
 
 get(Name, Property) ->
     gen_server:call(Name, {get, Property}).
@@ -47,13 +58,9 @@ set(Name, Property, _Value) ->
     error_logger:info_msg("?MODULE:set for ~p with ~p not implemented~n",
                           [Name, Property]).
 
-stop(Name) when is_atom(Name) ->
-    gen_server:cast(Name, stop);
-stop(Pid) when is_pid(Pid) ->
-    gen_server:cast(Pid, stop);
-stop({local, Name}) ->
-    stop(Name);
-stop({global, Name}) ->
+stop(Name) when is_atom(Name) orelse is_pid(Name) ->
+    gen_server:call(Name, stop);
+stop({Scope, Name}) when Scope =:= local orelse Scope =:= global ->
     stop(Name);
 stop(Options) ->
     State = parse_options(Options),
@@ -61,10 +68,21 @@ stop(Options) ->
 
 %% Internal API
 
+parse_options(State=#mochiweb_socket_server{}) ->
+    State;
 parse_options(Options) ->
     parse_options(Options, #mochiweb_socket_server{}).
 
-parse_options([], State) ->
+parse_options([], State=#mochiweb_socket_server{acceptor_pool_size=PoolSize,
+                                                max=Max}) ->
+    case Max < PoolSize of
+        true ->
+            error_logger:info_report([{warning, "max is set lower than acceptor_pool_size"},
+                                      {max, Max},
+                                      {acceptor_pool_size, PoolSize}]);
+        false ->
+            ok
+    end,
     State;
 parse_options([{name, L} | Rest], State) when is_list(L) ->
     Name = {local, list_to_atom(L)},
@@ -103,8 +121,6 @@ parse_options([{acceptor_pool_size, Max} | Rest], State) ->
     parse_options(Rest,
                   State#mochiweb_socket_server{acceptor_pool_size=MaxInt});
 parse_options([{max, Max} | Rest], State) ->
-    error_logger:info_report([{warning, "TODO: max is currently unsupported"},
-                              {max, Max}]),
     MaxInt = ensure_int(Max),
     parse_options(Rest, State#mochiweb_socket_server{max=MaxInt});
 parse_options([{ssl, Ssl} | Rest], State) when is_boolean(Ssl) ->
@@ -116,21 +132,22 @@ parse_options([{profile_fun, ProfileFun} | Rest], State) when is_function(Profil
     parse_options(Rest, State#mochiweb_socket_server{profile_fun=ProfileFun}).
 
 
-start_server(State=#mochiweb_socket_server{ssl=Ssl, name=Name}) ->
-    case Ssl of
-        true ->
-            application:start(crypto),
-            application:start(public_key),
-            application:start(ssl);
-        false ->
-            void
-    end,
+start_server(F, State=#mochiweb_socket_server{ssl=Ssl, name=Name}) ->
+    ok = prep_ssl(Ssl),
     case Name of
         undefined ->
-            gen_server:start_link(?MODULE, State, []);
+            gen_server:F(?MODULE, State, []);
         _ ->
-            gen_server:start_link(Name, ?MODULE, State, [])
+            gen_server:F(Name, ?MODULE, State, [])
     end.
+
+prep_ssl(true) ->
+    ok = mochiweb:ensure_started(crypto),
+    ok = mochiweb:ensure_started(asn1),
+    ok = mochiweb:ensure_started(public_key),
+    ok = mochiweb:ensure_started(ssl);
+prep_ssl(false) ->
+    ok.
 
 ensure_int(N) when is_integer(N) ->
     N;
@@ -152,6 +169,7 @@ init(State=#mochiweb_socket_server{ip=Ip, port=Port, backlog=Backlog, nodelay=No
                 {packet, 0},
                 {backlog, Backlog},
                 {recbuf, ?RECBUF_SIZE},
+                {exit_on_close, false},
                 {active, false},
                 {nodelay, NoDelay}],
     Opts = case Ip of
@@ -165,27 +183,7 @@ init(State=#mochiweb_socket_server{ip=Ip, port=Port, backlog=Backlog, nodelay=No
         {_, _, _, _, _, _, _, _} -> % IPv6
             [inet6, {ip, Ip} | BaseOpts]
     end,
-    case listen(Port, Opts, State) of
-        {stop, eacces} ->
-            case Port < 1024 of
-                true ->
-                    case catch fdsrv:start() of
-                        {ok, _} ->
-                            case fdsrv:bind_socket(tcp, Port) of
-                                {ok, Fd} ->
-                                    listen(Port, [{fd, Fd} | Opts], State);
-                                _ ->
-                                    {stop, fdsrv_bind_failed}
-                            end;
-                        _ ->
-                            {stop, fdsrv_start_failed}
-                    end;
-                false ->
-                    {stop, eacces}
-            end;
-        Other ->
-            Other
-    end.
+    listen(Port, Opts, State).
 
 new_acceptor_pool(Listen,
                   State=#mochiweb_socket_server{acceptor_pool=Pool,
@@ -212,6 +210,8 @@ listen(Port, Opts, State=#mochiweb_socket_server{ssl=Ssl, ssl_opts=SslOpts}) ->
 
 do_get(port, #mochiweb_socket_server{port=Port}) ->
     Port;
+do_get(waiting_acceptors, #mochiweb_socket_server{acceptor_pool=Pool}) ->
+    sets:size(Pool);
 do_get(active_sockets, #mochiweb_socket_server{active_sockets=ActiveSockets}) ->
     ActiveSockets.
 
@@ -240,6 +240,8 @@ handle_call(Req, From, State) when ?is_old_state(State) ->
 handle_call({get, Property}, _From, State) ->
     Res = do_get(Property, State),
     {reply, Res, State};
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
 handle_call(_Message, _From, State) ->
     Res = error,
     {reply, Res, State}.
@@ -264,38 +266,46 @@ handle_cast({set, profile_fun, ProfileFun}, State) ->
                  _ ->
                      State
              end,
-    {noreply, State1};
-handle_cast(stop, State) ->
-    {stop, normal, State}.
+    {noreply, State1}.
 
 
 terminate(Reason, State) when ?is_old_state(State) ->
     terminate(Reason, upgrade_state(State));
-terminate(_Reason, #mochiweb_socket_server{listen=Listen, port=Port}) ->
-    mochiweb_socket:close(Listen),
-    case Port < 1024 of
-        true ->
-            catch fdsrv:stop(),
-            ok;
-        false ->
-            ok
-    end.
+terminate(_Reason, #mochiweb_socket_server{listen=Listen}) ->
+    mochiweb_socket:close(Listen).
 
 code_change(_OldVsn, State, _Extra) ->
     State.
 
 recycle_acceptor(Pid, State=#mochiweb_socket_server{
                         acceptor_pool=Pool,
+                        acceptor_pool_size=PoolSize,
                         listen=Listen,
                         loop=Loop,
+                        max=Max,
                         active_sockets=ActiveSockets}) ->
     case sets:is_element(Pid, Pool) of
         true ->
-            Acceptor = mochiweb_acceptor:start_link(self(), Listen, Loop),
-            Pool1 = sets:add_element(Acceptor, sets:del_element(Pid, Pool)),
-            State#mochiweb_socket_server{acceptor_pool=Pool1};
+            Pool1 = sets:del_element(Pid, Pool),
+            case ActiveSockets + sets:size(Pool1) < Max of
+                true ->
+                    Acceptor = mochiweb_acceptor:start_link(self(), Listen, Loop),
+                    Pool2 = sets:add_element(Acceptor, Pool1),
+                    State#mochiweb_socket_server{acceptor_pool=Pool2};
+                false ->
+                    State#mochiweb_socket_server{acceptor_pool=Pool1}
+            end;
         false ->
-            State#mochiweb_socket_server{active_sockets=ActiveSockets - 1}
+            case sets:size(Pool) < PoolSize of
+                true ->
+                    Acceptor = mochiweb_acceptor:start_link(self(), Listen, Loop),
+                    Pool1 = sets:add_element(Acceptor, Pool),
+                    State#mochiweb_socket_server{active_sockets=ActiveSockets,
+                                                 acceptor_pool=Pool1};
+                false ->
+                    State#mochiweb_socket_server{active_sockets=ActiveSockets - 1,
+                                                 acceptor_pool=Pool}
+            end
     end.
 
 handle_info(Msg, State) when ?is_old_state(State) ->
@@ -361,4 +371,3 @@ upgrade_state_test() ->
     ?assertEqual(CmpState, State).
 
 -endif.
-

@@ -17,6 +17,11 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
+%%
+%% @doc Returns a list of all partitions, how many primary replicas
+%%      are available, what the current n_val and quorum
+%%      configuration is, as well as the unavailable nodes for
+%%      each partition.
 
 -module(riak_control_wm_partitions).
 
@@ -28,14 +33,14 @@
          service_available/2,
          forbidden/2]).
 
--include_lib("riak_control/include/riak_control.hrl").
+-include("riak_control.hrl").
 -include_lib("webmachine/include/webmachine.hrl").
 
 -define(CONTENT_TYPES, [{"application/json",to_json}]).
 
 -define(VNODE_TYPES, [riak_kv,riak_pipe,riak_search]).
 
--record(context, {partitions}).
+-record(context, {partitions, default_n_val}).
 -type context() :: #context{}.
 
 %% @doc Route handling.
@@ -44,42 +49,40 @@ routes() ->
     [{riak_control_routes:partitions_route(), ?MODULE, []}].
 
 %% @doc Get partition list at the start of the request.
--spec init(list()) ->
-                  {ok, context()}.
+-spec init(list()) -> {ok, context()}.
 init([]) ->
     {ok, _, Partitions} = riak_control_session:get_partitions(),
-    {ok, #context{partitions=Partitions}}.
+    {ok, _, DefNVal} = riak_control_session:get_default_n_val(),
+    {ok, #context{partitions=Partitions, default_n_val=DefNVal}}.
 
 %% @doc Validate origin.
 -spec forbidden(wrq:reqdata(), context()) ->
-                       {boolean(), wrq:reqdata(), context()}.
+    {boolean(), wrq:reqdata(), context()}.
 forbidden(ReqData, Context) ->
     {riak_control_security:is_null_origin(ReqData), ReqData, Context}.
 
 %% @doc Determine if it's available.
 -spec service_available(wrq:reqdata(), context()) ->
-                               {boolean() | {halt, non_neg_integer()}, wrq:reqdata(), context()}.
+    {boolean() | {halt, non_neg_integer()}, wrq:reqdata(), context()}.
 service_available(ReqData, Context) ->
     riak_control_security:scheme_is_available(ReqData, Context).
 
 %% @doc Handle authorization.
 -spec is_authorized(wrq:reqdata(), context()) ->
-                           {true | string(), wrq:reqdata(), context()}.
+    {true | string(), wrq:reqdata(), context()}.
 is_authorized(ReqData, Context) ->
     riak_control_security:enforce_auth(ReqData, Context).
 
 %% @doc Return available content types.
 -spec content_types_provided(wrq:reqdata(), context()) ->
-         {[{ContentType::string(), HandlerFunction::atom()}],
-          wrq:reqdata(), context()}.
+    {[{ContentType::string(), HandlerFunction::atom()}], wrq:reqdata(), context()}.
 content_types_provided(ReqData, Context) ->
     {?CONTENT_TYPES, ReqData, Context}.
 
 %% @doc Return a list of partitions.
--spec to_json(wrq:reqdata(),context()) ->  {iolist(), wrq:reqdata(), context()}.
-to_json(ReqData, Context) ->
-    {ok, _, Nodes} = riak_control_session:get_nodes(),
-    Details = [{struct,
-                riak_control_formatting:node_ring_details(P, Nodes)} ||
-                P <- Context#context.partitions],
-    {mochijson2:encode({struct,[{partitions,Details}]}), ReqData, Context}.
+-spec to_json(wrq:reqdata(),context()) ->
+    {iolist(), wrq:reqdata(), context()}.
+to_json(ReqData, Context=#context{partitions=Partitions, default_n_val=DefNVal}) ->
+    Encoded = mochijson2:encode({struct,[{partitions, Partitions},
+                                         {default_n_val, DefNVal}]}),
+    {Encoded, ReqData, Context}.

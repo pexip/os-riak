@@ -7,6 +7,18 @@
           start_time :: non_neg_integer(),
           options :: list()}).
 
+-record(riak_kv_w1c_put_req_v1, {
+    bkey :: {binary(),binary()},
+    encoded_obj :: binary(),
+    type :: primary | fallback
+    % start_time :: non_neg_integer(), Jon to add?
+}).
+
+-record(riak_kv_w1c_put_reply_v1, {
+    reply :: ok | {error, term()},
+    type :: primary | fallback
+}).
+
 -record(riak_kv_get_req_v1, {
           bkey :: {binary(), binary()},
           req_id :: non_neg_integer()}).
@@ -56,6 +68,8 @@
          }).
 
 -define(KV_PUT_REQ, #riak_kv_put_req_v1).
+-define(KV_W1C_PUT_REQ, #riak_kv_w1c_put_req_v1).
+-define(KV_W1C_PUT_REPLY, #riak_kv_w1c_put_reply_v1).
 -define(KV_GET_REQ, #riak_kv_get_req_v1).
 -define(KV_LISTBUCKETS_REQ, #riak_kv_listbuckets_req_v1).
 -define(KV_LISTKEYS_REQ, #riak_kv_listkeys_req_v4).
@@ -64,3 +78,8 @@
 -define(KV_DELETE_REQ, #riak_kv_delete_req_v1).
 -define(KV_MAP_REQ, #riak_kv_map_req_v1).
 -define(KV_VCLOCK_REQ, #riak_kv_vclock_req_v1).
+
+%% @doc vnode_lock(PartitionIndex) is a kv per-vnode lock, used possibly,
+%% by AAE tree rebuilds, fullsync, and handoff.
+%% See @link riak_core_background_mgr:get_lock/1
+-define(KV_VNODE_LOCK(Idx), {vnode_lock, Idx}).

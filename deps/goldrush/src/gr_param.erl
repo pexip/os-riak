@@ -89,7 +89,7 @@ transform(Server) ->
 %% @doc
 %% Starts the server
 %%
-%% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
+%% @spec start_link(Name) -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
 start_link(Name) ->
@@ -188,7 +188,7 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_info({'ETS-TRANSFER', TableId, _Pid, _Data}, State) ->
-    [ gen_server:reply(From, perform_call(TableId, Call)) 
+    _ = [ gen_server:reply(From, perform_call(TableId, Call)) 
       || {Call, From} <- State#state.waiting ],
     {noreply, State#state{table_id=TableId, waiting=[]}};
 handle_info(_Info, State) ->

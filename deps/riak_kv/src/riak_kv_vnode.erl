@@ -2,7 +2,7 @@
 %%
 %% riak_kv_vnode: VNode Implementation
 %%
-%% Copyright (c) 2007-2010 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2007-2015 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -20,9 +20,6 @@
 %%
 %% -------------------------------------------------------------------
 -module(riak_kv_vnode).
--author('Kevin Smith <kevin@basho.com>').
--author('John Muellerleile <johnm@basho.com>').
-
 -behaviour(riak_core_vnode).
 
 %% API
@@ -40,6 +37,7 @@
          readrepair/6,
          list_keys/4,
          fold/3,
+         fold/4,
          get_vclocks/2,
          vnode_status/1,
          ack_keys/1,
@@ -67,23 +65,44 @@
          nval_map/1,
          handle_handoff_command/3,
          handoff_starting/2,
+         handoff_started/2,     %% Note: optional function of the behaviour
          handoff_cancelled/1,
          handoff_finished/2,
          handle_handoff_data/2,
          encode_handoff_item/2,
          handle_exit/3,
-         handle_info/2]).
+         handle_info/2,
+         handle_overload_info/2,
+         ready_to_exit/0]). %% Note: optional function of the behaviour
 
 -export([handoff_data_encoding_method/0]).
+-export([set_vnode_forwarding/2]).
 
 -include_lib("riak_kv_vnode.hrl").
 -include_lib("riak_kv_index.hrl").
 -include_lib("riak_kv_map_phase.hrl").
--include_lib("riak_core/include/riak_core_pb.hrl").
+-include_lib("riak_core_pb.hrl").
+-include("riak_kv_types.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("riak_core/include/riak_core_bg_manager.hrl").
 -export([put_merge/6]). %% For fsm_eqc_vnode
+-endif.
+
+%% N.B. The ?INDEX macro should be called any time the object bytes on
+%% disk are modified.
+-ifdef(TEST).
+%% Use values so that test compile doesn't give 'unused vars' warning.
+-define(INDEX(A,B,C), _=element(1,{A,B,C}), ok).
+-else.
+-define(INDEX(Obj, Reason, Partition), yz_kv:index(Obj, Reason, Partition)).
+-endif.
+
+-ifdef(TEST).
+-define(YZ_SHOULD_HANDOFF(X), true).
+-else.
+-define(YZ_SHOULD_HANDOFF(X), yz_kv:should_handoff(X)).
 -endif.
 
 -record(mrjob, {cachekey :: term(),
@@ -91,8 +110,27 @@
                 reqid :: term(),
                 target :: pid()}).
 
+-record(counter_state, {
+          %% kill switch, if for any reason one wants disable per-key-epoch, then set
+          %% [{riak_kv, [{per_key_epoch, false}]}].
+          use = true :: boolean(),
+          %% The number of new epoch writes co-ordinated by this vnode
+          %% What even is a "key epoch?" It is any time a key is
+          %% (re)created. A new write, a write not yet coordinated by
+          %% this vnode, a write where local state is unreadable.
+          cnt = 0 :: non_neg_integer(),
+          %% Counter leased up-to. For totally new state/id
+          %% this will be that flush threshold See config value
+          %% `{riak_kv, counter_lease_size}'
+          lease = 0 :: non_neg_integer(),
+          lease_size = 0 :: non_neg_integer(),
+          %% Has a lease been requested but not granted yet
+          leasing = false :: boolean()
+         }).
+
 -record(state, {idx :: partition(),
                 mod :: module(),
+                async_put :: boolean(),
                 modstate :: term(),
                 mrjobs :: term(),
                 vnodeid :: undefined | binary(),
@@ -102,14 +140,47 @@
                 key_buf_size :: pos_integer(),
                 async_folding :: boolean(),
                 in_handoff = false :: boolean(),
-                hashtrees :: pid() }).
+                handoff_target :: node(),
+                handoffs_rejected = 0 :: integer(),
+                forward :: node() | [{integer(), node()}],
+                hashtrees :: pid(),
+                md_cache :: ets:tab(),
+                md_cache_size :: pos_integer(),
+                counter :: #counter_state{},
+                status_mgr_pid :: pid() %% a process that manages vnode status persistence
+               }).
 
 -type index_op() :: add | remove.
 -type index_value() :: integer() | binary().
 -type index() :: non_neg_integer().
 -type state() :: #state{}.
+-type vnodeid() :: binary().
+-type counter_lease_error() :: {error, counter_lease_max_errors | counter_lease_timeout}.
 
+-define(MD_CACHE_BASE, "riak_kv_vnode_md_cache").
 -define(DEFAULT_HASHTREE_TOKENS, 90).
+
+%% default value for `counter_lease' in `#counter_state{}'
+%% NOTE: these MUST be positive integers!
+%% @see non_neg_env/3
+-define(DEFAULT_CNTR_LEASE, 10000).
+%% On advise/review from Scott decided to cap the size of leases. 50m
+%% is a lot of new epochs for a single vnode, and it saves us from
+%% buring through vnodeids in the worst case.
+-define(MAX_CNTR_LEASE, 50000000).
+%% Should these cuttlefish-able?  If it takes more than 20 attempts to
+%% fsync the vnode counter to disk, die. (NOTE this is not ERRS*TO but
+%% first to trip see blocking_lease_counter/3)
+-define(DEFAULT_CNTR_LEASE_ERRS, 20).
+%% If it takes more than 20 seconds to fsync the vnode counter to disk,
+%% die
+-define(DEFAULT_CNTR_LEASE_TO, 20000). % 20 seconds!
+
+
+%% Erlang's if Bool -> thing; true -> thang end. syntax hurts my
+%% brain. It scans as if true -> thing; true -> thang end. So, here is
+%% a macro, ?ELSE to use in if statements. You're welcome.
+-define(ELSE, true).
 
 -record(putargs, {returnbody :: boolean(),
                   coord:: boolean(),
@@ -122,7 +193,7 @@
                   starttime :: non_neg_integer(),
                   prunetime :: undefined| non_neg_integer(),
                   is_index=false :: boolean(), %% set if the b/end supports indexes
-                  counter_op = undefined :: undefined | integer() %% if set this is a counter operation
+                  crdt_op = undefined :: undefined | term() %% if set this is a crdt operation
                  }).
 
 -spec maybe_create_hashtrees(state()) -> state().
@@ -139,7 +210,12 @@ maybe_create_hashtrees(true, State=#state{idx=Index,
     case riak_core_ring:vnode_type(Ring, Index) of
         primary ->
             {ok, ModCaps} = Mod:capabilities(ModState),
-            Opts = [use_2i || lists:member(indexes, ModCaps)],
+            Empty = case is_empty(State) of
+                        {true, _}     -> true;
+                        {false, _, _} -> false
+                    end,
+            Opts = [use_2i || lists:member(indexes, ModCaps)]
+                   ++ [vnode_empty || Empty],
             case riak_kv_index_hashtree:start(Index, self(), Opts) of
                 {ok, Trees} ->
                     monitor(process, Trees),
@@ -170,7 +246,7 @@ get(Preflist, BKey, ReqId) ->
     get(Preflist, BKey, ReqId, {fsm, undefined, self()}).
 
 get(Preflist, BKey, ReqId, Sender) ->
-    Req = ?KV_GET_REQ{bkey=BKey,
+    Req = ?KV_GET_REQ{bkey=sanitize_bkey(BKey),
                       req_id=ReqId},
     riak_core_vnode_master:command(Preflist,
                                    Req,
@@ -179,7 +255,7 @@ get(Preflist, BKey, ReqId, Sender) ->
 
 del(Preflist, BKey, ReqId) ->
     riak_core_vnode_master:command(Preflist,
-                                   ?KV_DELETE_REQ{bkey=BKey,
+                                   ?KV_DELETE_REQ{bkey=sanitize_bkey(BKey),
                                                   req_id=ReqId},
                                    riak_kv_vnode_master).
 
@@ -192,7 +268,7 @@ put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(Preflist,
                                    ?KV_PUT_REQ{
-                                      bkey = BKey,
+                                      bkey = sanitize_bkey(BKey),
                                       object = Obj,
                                       req_id = ReqId,
                                       start_time = StartTime,
@@ -242,7 +318,7 @@ coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(IndexNode,
                                    ?KV_PUT_REQ{
-                                      bkey = BKey,
+                                      bkey = sanitize_bkey(BKey),
                                       object = Obj,
                                       req_id = ReqId,
                                       start_time = StartTime,
@@ -264,10 +340,15 @@ list_keys(Preflist, ReqId, Caller, Bucket) ->
                                    riak_kv_vnode_master).
 
 fold(Preflist, Fun, Acc0) ->
+    Req = riak_core_util:make_fold_req(Fun, Acc0),
     riak_core_vnode_master:sync_spawn_command(Preflist,
-                                              ?FOLD_REQ{
-                                                 foldfun=Fun,
-                                                 acc0=Acc0},
+                                              Req,
+                                              riak_kv_vnode_master).
+
+fold(Preflist, Fun, Acc0, Options) ->
+    Req = riak_core_util:make_fold_req(Fun, Acc0, false, Options),
+    riak_core_vnode_master:sync_spawn_command(Preflist,
+                                              Req,
                                               riak_kv_vnode_master).
 
 get_vclocks(Preflist, BKeyList) ->
@@ -276,7 +357,6 @@ get_vclocks(Preflist, BKeyList) ->
                                               riak_kv_vnode_master).
 
 %% @doc Get status information about the node local vnodes.
--spec vnode_status([{partition(), pid()}]) -> [{atom(), term()}].
 vnode_status(PrefLists) ->
     ReqId = erlang:phash2({self(), os:timestamp()}),
     %% Get the status of each vnode
@@ -312,7 +392,7 @@ repair_filter(Target) ->
                                 riak_core_bucket:default_object_nval(),
                                 fun object_info/1).
 
--spec hashtree_pid(index()) -> {ok, pid()}.
+-spec hashtree_pid(index()) -> {ok, pid()} | {error, wrong_node}.
 hashtree_pid(Partition) ->
     riak_core_vnode_master:sync_command({Partition, node()},
                                         {hashtree_pid, node()},
@@ -351,7 +431,8 @@ rehash(Preflist, Bucket, Key) ->
                              ok | {error, term()}.
 reformat_object(Partition, BKey) ->
     riak_core_vnode_master:sync_spawn_command({Partition, node()},
-                                              {reformat_object, BKey},
+                                              {reformat_object,
+                                               sanitize_bkey(BKey)},
                                               riak_kv_vnode_master).
 
 %% VNode callbacks
@@ -363,22 +444,46 @@ init([Index]) ->
     IndexBufSize = app_helper:get_env(riak_kv, index_buffer_size, 100),
     KeyBufSize = app_helper:get_env(riak_kv, key_buffer_size, 100),
     WorkerPoolSize = app_helper:get_env(riak_kv, worker_pool_size, 10),
-    {ok, VId} = get_vnodeid(Index),
+    UseEpochCounter = app_helper:get_env(riak_kv, use_epoch_counter, true),
+    %%  This _has_ to be a non_neg_integer(), and really, if it is
+    %%  zero, you are fsyncing every.single.key epoch.
+    CounterLeaseSize = min(?MAX_CNTR_LEASE,
+                           non_neg_env(riak_kv, counter_lease_size, ?DEFAULT_CNTR_LEASE)),
+    {ok, StatusMgr} = riak_kv_vnode_status_mgr:start_link(self(), Index, UseEpochCounter),
+    {ok, {VId, CounterState}} = get_vnodeid_and_counter(StatusMgr, CounterLeaseSize, UseEpochCounter),
     DeleteMode = app_helper:get_env(riak_kv, delete_mode, 3000),
     AsyncFolding = app_helper:get_env(riak_kv, async_folds, true) == true,
+    MDCacheSize = app_helper:get_env(riak_kv, vnode_md_cache_size),
+    MDCache =
+        case MDCacheSize of
+            N when is_integer(N),
+                   N > 0 ->
+                lager:debug("Initializing metadata cache with size limit: ~p bytes",
+                           [MDCacheSize]),
+                new_md_cache(VId);
+            _ ->
+                lager:debug("No metadata cache size defined, not starting"),
+                undefined
+        end,
     case catch Mod:start(Index, Configuration) of
         {ok, ModState} ->
             %% Get the backend capabilities
             State = #state{idx=Index,
                            async_folding=AsyncFolding,
                            mod=Mod,
+                           async_put = erlang:function_exported(Mod, async_put, 5),
                            modstate=ModState,
                            vnodeid=VId,
+                           counter=CounterState,
+                           status_mgr_pid=StatusMgr,
                            delete_mode=DeleteMode,
                            bucket_buf_size=BucketBufSize,
                            index_buf_size=IndexBufSize,
                            key_buf_size=KeyBufSize,
-                           mrjobs=dict:new()},
+                           mrjobs=dict:new(),
+                           md_cache=MDCache,
+                           md_cache_size=MDCacheSize},
+            try_set_vnode_lock_limit(Index),
             case AsyncFolding of
                 true ->
                     %% Create worker pool initialization tuple
@@ -389,24 +494,42 @@ init([Index]) ->
                     {ok, State}
             end;
         {error, Reason} ->
-            lager:error("Failed to start ~p Reason: ~p",
-                        [Mod, Reason]),
+            lager:error("Failed to start ~p backend for index ~p error: ~p",
+                        [Mod, Index, Reason]),
             riak:stop("backend module failed to start."),
             {error, Reason};
         {'EXIT', Reason1} ->
-            lager:error("Failed to start ~p Reason: ~p",
-                        [Mod, Reason1]),
+            lager:error("Failed to start ~p backend for index ~p crash: ~p",
+                        [Mod, Index, Reason1]),
             riak:stop("backend module failed to start."),
             {error, Reason1}
     end.
 
 
 handle_overload_command(?KV_PUT_REQ{}, Sender, Idx) ->
-    riak_core_vnode:reply(Sender, {fail, Idx, overload}); % subvert ReqId
+    riak_core_vnode:reply(Sender, {fail, Idx, overload});
 handle_overload_command(?KV_GET_REQ{req_id=ReqID}, Sender, Idx) ->
     riak_core_vnode:reply(Sender, {r, {error, overload}, Idx, ReqID});
-handle_overload_command(_, _, _) ->
-    %% not handled yet
+handle_overload_command(?KV_VNODE_STATUS_REQ{}, Sender, Idx) ->
+    riak_core_vnode:reply(Sender, {vnode_status, Idx, [{error, overload}]});
+handle_overload_command(?KV_W1C_PUT_REQ{type=Type}, Sender, _Idx) ->
+    riak_core_vnode:reply(Sender, ?KV_W1C_PUT_REPLY{reply={error, overload}, type=Type});
+handle_overload_command(_, Sender, _) ->
+    riak_core_vnode:reply(Sender, {error, mailbox_overload}).
+
+%% Handle all SC overload messages here
+handle_overload_info({ensemble_ping, _From}, _Idx) ->
+    %% Don't respond to pings in overload
+    ok;
+handle_overload_info({ensemble_get, _, From}, _Idx) ->
+    riak_kv_ensemble_backend:reply(From, {error, vnode_overload});
+handle_overload_info({ensemble_put, _, _, From}, _Idx) ->
+    riak_kv_ensemble_backend:reply(From, {error, vnode_overload});
+handle_overload_info({raw_forward_put, _, _, From}, _Idx) ->
+    riak_kv_ensemble_backend:reply(From, {error, vnode_overload});
+handle_overload_info({raw_forward_get, _, From}, _Idx) ->
+    riak_kv_ensemble_backend:reply(From, {error, vnode_overload});
+handle_overload_info(_, _) ->
     ok.
 
 handle_command(?KV_PUT_REQ{bkey=BKey,
@@ -417,7 +540,7 @@ handle_command(?KV_PUT_REQ{bkey=BKey,
                Sender, State=#state{idx=Idx}) ->
     StartTS = os:timestamp(),
     riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
-    UpdState = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
+    {_Reply, UpdState} = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
     update_vnode_stats(vnode_put, Idx, StartTS),
     {noreply, UpdState};
 
@@ -451,7 +574,7 @@ handle_command(#riak_kv_listkeys_req_v2{bucket=Input, req_id=ReqId, caller=Calle
                         UniqueResults = lists:usort(Results),
                         Caller ! {ReqId, {kl, Idx, UniqueResults}}
                 end,
-            FoldFun = fold_fun(buckets, BufferMod, Filter),
+            FoldFun = fold_fun(buckets, BufferMod, Filter, undefined),
             ModFun = fold_buckets;
         _ ->
             {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
@@ -466,7 +589,8 @@ handle_command(#riak_kv_listkeys_req_v2{bucket=Input, req_id=ReqId, caller=Calle
                 fun(Results) ->
                         Caller ! {ReqId, {kl, Idx, Results}}
                 end,
-            FoldFun = fold_fun(keys, BufferMod, Filter),
+            Extras = fold_extras_keys(Idx, Bucket),
+            FoldFun = fold_fun(keys, BufferMod, Filter, Extras),
             ModFun = fold_keys
     end,
     Buffer = BufferMod:new(BufferSize, BufferFun),
@@ -481,11 +605,19 @@ handle_command(#riak_kv_listkeys_req_v2{bucket=Input, req_id=ReqId, caller=Calle
         _ ->
             {noreply, State}
     end;
-handle_command(?KV_DELETE_REQ{bkey=BKey, req_id=ReqId}, _Sender, State) ->
-    do_delete(BKey, ReqId, State);
+handle_command(?KV_DELETE_REQ{bkey=BKey}, _Sender, State) ->
+    do_delete(BKey, State);
 handle_command(?KV_VCLOCK_REQ{bkeys=BKeys}, _Sender, State) ->
     {reply, do_get_vclocks(BKeys, State), State};
-handle_command(?FOLD_REQ{foldfun=FoldFun, acc0=Acc0}, Sender, State) ->
+handle_command(#riak_core_fold_req_v1{} = ReqV1,
+               Sender, State) ->
+    %% Use make_fold_req() to upgrade to the most recent ?FOLD_REQ
+    handle_command(riak_core_util:make_newest_fold_req(ReqV1), Sender, State);
+handle_command(?FOLD_REQ{foldfun=FoldFun, acc0=Acc0,
+                         forwardable=_Forwardable, opts=Opts}, Sender, State) ->
+    %% The riak_core layer takes care of forwarding/not forwarding, so
+    %% we ignore forwardable here.
+    %%
     %% The function in riak_core used for object folding expects the
     %% bucket and key pair to be passed as the first parameter, but in
     %% riak_kv the bucket and key have been separated. This function
@@ -493,7 +625,7 @@ handle_command(?FOLD_REQ{foldfun=FoldFun, acc0=Acc0}, Sender, State) ->
     FoldWrapper = fun(Bucket, Key, Value, Acc) ->
                           FoldFun({Bucket, Key}, Value, Acc)
                   end,
-    do_fold(FoldWrapper, Acc0, Sender, State);
+    do_fold(FoldWrapper, Acc0, Sender, Opts, State);
 
 %% entropy exchange commands
 handle_command({hashtree_pid, Node}, _, State=#state{hashtrees=HT}) ->
@@ -529,21 +661,22 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
     IndexCap = lists:member(indexes, Caps),
     case IndexCap of
         true ->
-            {Exists, RObj, IdxData} =
+            {Exists, RObj, IdxData, ModState2} =
             case do_get_term(BKey, Mod, ModState) of
-                {ok, ExistingObj} ->
-                    {true, ExistingObj, riak_object:index_data(ExistingObj)};
-                _ ->
-                    {false, undefined, []}
+                {{ok, ExistingObj}, UpModState} ->
+                    {true, ExistingObj, riak_object:index_data(ExistingObj),
+                     UpModState};
+                {{error, _}, UpModState} ->
+                    {false, undefined, [], UpModState}
             end,
             IndexSpecs = riak_object:diff_index_data(OldIdxData, IdxData),
-            {Reply, UpModState} = 
-            case Mod:put(Bucket, Key, IndexSpecs, undefined, ModState) of
-                {ok, ModState2} ->
-                    riak_kv_stat:update(vnode_index_refresh),
-                    {ok, ModState2};
-                {error, Reason, ModState2} ->
-                    {{error, Reason}, ModState2}
+            {Reply, ModState3} =
+            case Mod:put(Bucket, Key, IndexSpecs, undefined, ModState2) of
+                {ok, UpModState2} ->
+                    ok = riak_kv_stat:update(vnode_index_refresh),
+                    {ok, UpModState2};
+                {error, Reason, UpModState2} ->
+                    {{error, Reason}, UpModState2}
             end,
             case Exists of
                 true ->
@@ -552,7 +685,7 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
                     delete_from_hashtree(Bucket, Key, State)
             end,
             riak_core_vnode:reply(Sender, Reply),
-            {noreply, State#state{modstate=UpModState}};
+            {noreply, State#state{modstate=ModState3}};
         false ->
             {reply, {error, {indexes_not_supported, Mod}}, State}
     end;
@@ -601,9 +734,14 @@ handle_command(?KV_VNODE_STATUS_REQ{},
                _Sender,
                State=#state{idx=Index,
                             mod=Mod,
-                            modstate=ModState}) ->
+                            modstate=ModState,
+                            counter=CS,
+                            vnodeid=VId}) ->
     BackendStatus = {backend_status, Mod, Mod:status(ModState)},
-    VNodeStatus = [BackendStatus],
+    #counter_state{cnt=Cnt, lease=Lease, lease_size=LeaseSize, leasing=Leasing} = CS,
+    CounterStatus = [{counter, Cnt}, {counter_lease, Lease},
+                     {counter_lease_size, LeaseSize}, {counter_leasing, Leasing}],
+    VNodeStatus = [BackendStatus, {vnodeid, VId} | CounterStatus],
     {reply, {vnode_status, Index, VNodeStatus}, State};
 handle_command({reformat_object, BKey}, _Sender, State) ->
     {Reply, UpdState} = do_reformat(BKey, State),
@@ -679,6 +817,29 @@ handle_command({get_index_entries, Opts},
         false ->
             lager:error("Backend ~p does not support incorrect index query", [Mod]),
             {reply, ignore, State}
+    end;
+
+%% NB. The following two function clauses discriminate on the async_put State field
+handle_command(?KV_W1C_PUT_REQ{bkey={Bucket, Key}, encoded_obj=EncodedVal, type=Type},
+                From, State=#state{mod=Mod, async_put=true, modstate=ModState}) ->
+    StartTS = os:timestamp(),
+    Context = {w1c_async_put, From, Type, Bucket, Key, EncodedVal, StartTS},
+    case Mod:async_put(Context, Bucket, Key, EncodedVal, ModState) of
+        {ok, UpModState} ->
+            {noreply, State#state{modstate=UpModState}};
+        {error, Reason, UpModState} ->
+            {reply, ?KV_W1C_PUT_REPLY{reply={error, Reason}, type=Type}, State#state{modstate=UpModState}}
+    end;
+handle_command(?KV_W1C_PUT_REQ{bkey={Bucket, Key}, encoded_obj=EncodedVal, type=Type},
+                _From, State=#state{idx=Idx, mod=Mod, async_put=false, modstate=ModState}) ->
+    StartTS = os:timestamp(),
+    case Mod:put(Bucket, Key, [], EncodedVal, ModState) of
+        {ok, UpModState} ->
+            update_hashtree(Bucket, Key, EncodedVal, State),
+            update_vnode_stats(vnode_put, Idx, StartTS),
+            {reply, ?KV_W1C_PUT_REPLY{reply=ok, type=Type}, State#state{modstate=UpModState}};
+        {error, Reason, UpModState} ->
+            {reply, ?KV_W1C_PUT_REPLY{reply={error, Reason}, type=Type}, State#state{modstate=UpModState}}
     end.
 
 %% @doc Handle a coverage request.
@@ -693,10 +854,11 @@ handle_coverage(?KV_LISTBUCKETS_REQ{item_filter=ItemFilter},
                              mod=Mod,
                              modstate=ModState}) ->
     %% Construct the filter function
-    Filter = riak_kv_coverage_filter:build_filter(all, ItemFilter, undefined),
+    Filter = riak_kv_coverage_filter:build_filter(ItemFilter),
     BufferMod = riak_kv_fold_buffer,
+
     Buffer = BufferMod:new(BufferSize, result_fun(Sender)),
-    FoldFun = fold_fun(buckets, BufferMod, Filter),
+    FoldFun = fold_fun(buckets, BufferMod, Filter, undefined),
     FinishFun = finish_fun(BufferMod, Sender),
     {ok, Capabilities} = Mod:capabilities(ModState),
     AsyncBackend = lists:member(async_fold, Capabilities),
@@ -743,6 +905,7 @@ handle_coverage(?KV_INDEX_REQ{bucket=Bucket,
     handle_coverage_index(Bucket, ItemFilter, Query,
                           FilterVNodes, Sender, State, fun result_fun_ack/2).
 
+-spec prepare_index_query(?KV_INDEX_Q{}) -> ?KV_INDEX_Q{}.
 prepare_index_query(#riak_kv_index_v3{term_regex=RE} = Q) when
         RE =/= undefined ->
     {ok, CompiledRE} = re:compile(RE),
@@ -770,7 +933,7 @@ handle_coverage_index(Bucket, ItemFilter, Query,
     case IndexBackend of
         true ->
             %% Update stats...
-            riak_kv_stat:update(vnode_index_read),
+            ok = riak_kv_stat:update(vnode_index_read),
 
             ResultFun = ResultFunFun(Bucket, Sender),
             BufSize = buffer_size_for_index_query(Query, DefaultBufSz),
@@ -812,7 +975,8 @@ handle_coverage_fold(FoldType, Bucket, ItemFilter, ResultFun,
     BufferMod = riak_kv_fold_buffer,
     BufferSize = proplists:get_value(buffer_size, Opts0, DefaultBufSz),
     Buffer = BufferMod:new(BufferSize, ResultFun),
-    FoldFun = fold_fun(keys, BufferMod, Filter),
+    Extras = fold_extras_keys(Index, Bucket),
+    FoldFun = fold_fun(keys, BufferMod, Filter, Extras),
     FinishFun = finish_fun(BufferMod, Sender),
     {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
     AsyncBackend = lists:member(async_fold, Capabilities),
@@ -829,17 +993,57 @@ handle_coverage_fold(FoldType, Bucket, ItemFilter, ResultFun,
             {noreply, State}
     end.
 
-%% While in handoff, vnodes have the option of returning {forward, State}
-%% which will cause riak_core to forward the request to the handoff target
-%% node. For riak_kv, we issue a put locally as well as forward it in case
-%% the vnode has already handed off the previous version. All other requests
-%% are handled locally and not forwarded since the relevant data may not have
-%% yet been handed off to the target node. Since we do not forward deletes it
-%% is possible that we do not clear a tombstone that was already handed off.
-%% This is benign as the tombstone will eventually be re-deleted.
+%% While in handoff, vnodes have the option of returning {forward,
+%% State}, or indeed, {forward, Req, State} which will cause riak_core
+%% to forward the request to the handoff target node. For riak_kv, we
+%% issue a put locally as well as forward it in case the vnode has
+%% already handed off the previous version. All other requests are
+%% handled locally and not forwarded since the relevant data may not
+%% have yet been handed off to the target node. Since we do not
+%% forward deletes it is possible that we do not clear a tombstone
+%% that was already handed off.  This is benign as the tombstone will
+%% eventually be re-deleted. NOTE: this makes write requests N+M where
+%% M is the number of vnodes forwarding.
 handle_handoff_command(Req=?KV_PUT_REQ{}, Sender, State) ->
-    {noreply, NewState} = handle_command(Req, Sender, State),
+    ?KV_PUT_REQ{options=Options} = Req,
+    case proplists:get_value(coord, Options, false) of
+        false ->
+            {noreply, NewState} = handle_command(Req, Sender, State),
+            {forward, NewState};
+        true ->
+            %% riak_kv#1046 - don't make fake siblings. Perform the
+            %% put, and create a new request to forward on, that
+            %% contains the frontier, much like the value returned to
+            %% a put fsm, then replicated.
+            #state{idx=Idx} = State,
+            ?KV_PUT_REQ{bkey=BKey,
+                        object=Object,
+                        req_id=ReqId,
+                        start_time=StartTime,
+                        options=Options} = Req,
+            StartTS = os:timestamp(),
+            riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
+            {Reply, UpdState} = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
+            update_vnode_stats(vnode_put, Idx, StartTS),
+
+            case Reply of
+                %%  NOTE: Coord is always `returnbody` as a put arg
+                {dw, Idx, NewObj, ReqId} ->
+                    %% DO NOT coordinate again at the next owner!
+                    NewReq = Req?KV_PUT_REQ{options=proplists:delete(coord, Options),
+                                            object=NewObj},
+                    {forward, NewReq, UpdState};
+                _Error ->
+                    %% Don't forward a failed attempt to put, as you
+                    %% need the successful object
+                    {noreply, UpdState}
+            end
+    end;
+
+handle_handoff_command(?KV_W1C_PUT_REQ{}=Request, Sender, State) ->
+    {noreply, NewState} = handle_command(Request, Sender, State),
     {forward, NewState};
+
 %% Handle all unspecified cases locally without forwarding
 handle_handoff_command(Req, Sender, State) ->
     handle_command(Req, Sender, State).
@@ -854,27 +1058,40 @@ request_hash(?KV_DELETE_REQ{bkey=BKey}) ->
 request_hash(_Req) ->
     undefined.
 
-handoff_starting(_TargetNode, State) ->
-    {true, State#state{in_handoff=true}}.
+handoff_starting({_HOType, TargetNode}=_X, State=#state{handoffs_rejected=RejectCount}) ->
+    MaxRejects = app_helper:get_env(riak_kv, handoff_rejected_max, 6),
+    case MaxRejects =< RejectCount orelse ?YZ_SHOULD_HANDOFF(_X) of
+        true ->
+            {true, State#state{in_handoff=true, handoff_target=TargetNode}};
+        false ->
+            {false, State#state{in_handoff=false, handoff_target=undefined, handoffs_rejected=RejectCount + 1 }}
+    end.
+
+%% @doc Optional callback that is exported, but not part of the behaviour.
+handoff_started(SrcPartition, WorkerPid) ->
+    case maybe_get_vnode_lock(SrcPartition, WorkerPid) of
+        ok ->
+            FoldOpts = [{iterator_refresh, true}],
+            {ok, FoldOpts};
+        max_concurrency -> {error, max_concurrency}
+    end.
 
 handoff_cancelled(State) ->
-    {ok, State#state{in_handoff=false}}.
+    {ok, State#state{in_handoff=false, handoff_target=undefined}}.
 
 handoff_finished(_TargetNode, State) ->
-    {ok, State}.
+    {ok, State#state{in_handoff=false, handoff_target=undefined}}.
 
 handle_handoff_data(BinObj, State) ->
     try
         {BKey, Val} = decode_binary_object(BinObj),
         {B, K} = BKey,
-        case do_diffobj_put(BKey, riak_object:from_binary(B, K, Val), 
+        case do_diffobj_put(BKey, riak_object:from_binary(B, K, Val),
                             State) of
             {ok, UpdModState} ->
                 {reply, ok, State#state{modstate=UpdModState}};
             {error, Reason, UpdModState} ->
-                {reply, {error, Reason}, State#state{modstate=UpdModState}};
-            Err ->
-                {reply, {error, Err}, State}
+                {reply, {error, Reason}, State#state{modstate=UpdModState}}
         end
     catch Error:Reason2 ->
             lager:warning("Unreadable object discarded in handoff: ~p:~p",
@@ -896,6 +1113,9 @@ encode_handoff_item({B, K}, V) ->
             corrupted
     end.
 
+set_vnode_forwarding(Forward, State) ->
+    State#state{forward=Forward}.
+
 is_empty(State=#state{mod=Mod, modstate=ModState}) ->
     IsEmpty = Mod:is_empty(ModState),
     case IsEmpty of
@@ -913,17 +1133,17 @@ maybe_calc_handoff_size(#state{mod=Mod,modstate=ModState}) ->
         false -> undefined
     end.
 
-delete(State=#state{idx=Index,mod=Mod, modstate=ModState}) ->
+delete(State=#state{status_mgr_pid=StatusMgr, mod=Mod, modstate=ModState}) ->
     %% clear vnodeid first, if drop removes data but fails
     %% want to err on the side of creating a new vnodeid
-    {ok, cleared} = clear_vnodeid(Index),
-    case Mod:drop(ModState) of
-        {ok, UpdModState} ->
-            ok;
-        {error, Reason, UpdModState} ->
-            lager:error("Failed to drop ~p. Reason: ~p~n", [Mod, Reason]),
-            ok
-    end,
+    {ok, cleared} = clear_vnodeid(StatusMgr),
+    UpdModState = case Mod:drop(ModState) of
+                      {ok, S} ->
+                          S;
+                      {error, Reason, S2} ->
+                          lager:error("Failed to drop ~p. Reason: ~p~n", [Mod, Reason]),
+                          S2
+                  end,
     case State#state.hashtrees of
         undefined ->
             ok;
@@ -935,6 +1155,86 @@ delete(State=#state{idx=Index,mod=Mod, modstate=ModState}) ->
 terminate(_Reason, #state{mod=Mod, modstate=ModState}) ->
     Mod:stop(ModState),
     ok.
+
+handle_info({{w1c_async_put, From, Type, Bucket, Key, EncodedVal, StartTS} = _Context, Reply},
+            State=#state{idx=Idx}) ->
+    update_hashtree(Bucket, Key, EncodedVal, State),
+    riak_core_vnode:reply(From, ?KV_W1C_PUT_REPLY{reply=Reply, type=Type}),
+    update_vnode_stats(vnode_put, Idx, StartTS),
+    {ok, State};
+
+handle_info({set_concurrency_limit, Lock, Limit}, State) ->
+    try_set_concurrency_limit(Lock, Limit),
+    {ok, State};
+
+handle_info({ensemble_ping, From}, State) ->
+    riak_ensemble_backend:pong(From),
+    {ok, State};
+
+handle_info({ensemble_get, Key, From}, State=#state{idx=Idx, forward=Fwd}) ->
+    case Fwd of
+        undefined ->
+            {reply, {r, Retval, _, _}, State2} = do_get(undefined, Key, undefined, State),
+            Reply = case Retval of
+                        {ok, Obj} ->
+                            Obj;
+                        _ ->
+                            notfound
+                    end,
+            riak_kv_ensemble_backend:reply(From, Reply),
+            {ok, State2};
+        Fwd when is_atom(Fwd) ->
+            forward_get({Idx, Fwd}, Key, From),
+            {ok, State}
+    end;
+
+handle_info({ensemble_put, Key, Obj, From}, State=#state{handoff_target=HOTarget,
+                                                         idx=Idx,
+                                                         forward=Fwd}) ->
+    case Fwd of
+        undefined ->
+            {Result, State2} = actual_put_tracked(Key, Obj, [], false, undefined, State),
+            Reply = case Result of
+                        {dw, _Idx, _Obj, _ReqID} ->
+                            Obj;
+                        {dw, _Idx, _ReqID} ->
+                            Obj;
+                        {fail, _Idx, _ReqID} ->
+                            failed
+                    end,
+            ((Reply =/= failed) and (HOTarget =/= undefined)) andalso raw_put(HOTarget, Key, Obj),
+            riak_kv_ensemble_backend:reply(From, Reply),
+            {ok, State2};
+        Fwd when is_atom(Fwd) ->
+            forward_put({Idx, Fwd}, Key, Obj, From),
+            {ok, State}
+    end;
+
+handle_info({raw_forward_put, Key, Obj, From}, State) ->
+    {Result, State2} = actual_put_tracked(Key, Obj, [], false, undefined, State),
+    Reply = case Result of
+                {dw, _Idx, _Obj, _ReqID} ->
+                    Obj;
+                {dw, _Idx, _ReqID} ->
+                    Obj;
+                {fail, _Idx, _ReqID} ->
+                    failed
+            end,
+    riak_kv_ensemble_backend:reply(From, Reply),
+    {ok, State2};
+handle_info({raw_forward_get, Key, From}, State) ->
+    {reply, {r, Retval, _, _}, State2} = do_get(undefined, Key, undefined, State),
+    Reply = case Retval of
+                {ok, Obj} ->
+                    Obj;
+                _ ->
+                    notfound
+            end,
+    riak_kv_ensemble_backend:reply(From, Reply),
+    {ok, State2};
+handle_info({raw_put, Key, Obj}, State) ->
+    {_, State2} = actual_put_tracked(Key, Obj, [], false, undefined, State),
+    {ok, State2};
 
 handle_info(retry_create_hashtree, State=#state{hashtrees=undefined}) ->
     State2 = maybe_create_hashtrees(State),
@@ -956,18 +1256,45 @@ handle_info({'DOWN', _, _, _, _}, State) ->
     {ok, State};
 handle_info({final_delete, BKey, RObjHash}, State = #state{mod=Mod, modstate=ModState}) ->
     UpdState = case do_get_term(BKey, Mod, ModState) of
-                   {ok, RObj} ->
+                   {{ok, RObj}, ModState1} ->
                        case delete_hash(RObj) of
                            RObjHash ->
-                               do_backend_delete(BKey, RObj, State);
+                               do_backend_delete(BKey, RObj, State#state{modstate=ModState1});
                          _ ->
-                               State
+                               State#state{modstate=ModState1}
                        end;
-                   _ ->
-                       State
+                   {{error, _}, ModState1} ->
+                       State#state{modstate=ModState1}
                end,
-    {ok, UpdState}.
+    {ok, UpdState};
+handle_info({counter_lease, {FromPid, VnodeId, NewLease}}, State=#state{status_mgr_pid=FromPid, vnodeid=VnodeId}) ->
+    #state{counter=CounterState} = State,
+    CS1 = CounterState#counter_state{lease=NewLease, leasing=false},
+    State2 = State#state{counter=CS1},
+    {ok, State2};
+handle_info({counter_lease, {FromPid, NewVnodeId, NewLease}}, State=#state{status_mgr_pid=FromPid, idx=Idx}) ->
+    %% Lease rolled over MAX_INT (new vnodeid signifies this) so reset counter
+    #state{counter=CounterState} = State,
+    CS1 = CounterState#counter_state{lease=NewLease, leasing=false, cnt=1},
+    State2 = State#state{vnodeid=NewVnodeId, counter=CS1},
+    lager:info("New Vnode id for ~p. Epoch counter rolled over.", [Idx]),
+    {ok, State2}.
 
+handle_exit(Pid, Reason, State=#state{status_mgr_pid=Pid, idx=Index, counter=CntrState}) ->
+    lager:error("Vnode status manager exit ~p", [Reason]),
+    %% The status manager died, start a new one
+    #counter_state{lease_size=LeaseSize, leasing=Leasing, use=UseEpochCounter} = CntrState,
+    {ok, NewPid} = riak_kv_vnode_status_mgr:start_link(self(), Index, UseEpochCounter),
+
+    if Leasing ->
+            %% Crashed when getting a lease, try again pathalogical
+            %% bad case here is that the lease gets to disk and the
+            %% manager crashes, meaning an ever growing lease/new ids
+            ok = riak_kv_vnode_status_mgr:lease_counter(NewPid, LeaseSize);
+       ?ELSE ->
+            ok
+    end,
+    {noreply, State#state{status_mgr_pid=NewPid}};
 handle_exit(_Pid, Reason, State) ->
     %% A linked processes has died so the vnode
     %% process should take appropriate action here.
@@ -979,23 +1306,47 @@ handle_exit(_Pid, Reason, State) ->
     lager:error("Linked process exited. Reason: ~p", [Reason]),
     {stop, linked_process_crash, State}.
 
+%% Optional Callback. A node is about to exit. Ensure that this node doesn't
+%% have any current ensemble members.
+ready_to_exit() ->
+    [] =:= riak_kv_ensembles:local_ensembles().
+
+%% @private
+forward_put({Idx, Node}, Key, Obj, From) ->
+    Proxy = riak_core_vnode_proxy:reg_name(riak_kv_vnode, Idx, Node),
+    riak_core_send_msg:bang_unreliable(Proxy, {raw_forward_put, Key, Obj, From}),
+    ok.
+
+%% @private
+forward_get({Idx, Node}, Key, From) ->
+    Proxy = riak_core_vnode_proxy:reg_name(riak_kv_vnode, Idx, Node),
+    riak_core_send_msg:bang_unreliable(Proxy, {raw_forward_get, Key, From}),
+    ok.
+
+%% @private
+raw_put({Idx, Node}, Key, Obj) ->
+    Proxy = riak_core_vnode_proxy:reg_name(riak_kv_vnode, Idx, Node),
+    %% Note: This cannot be bang_unreliable. Don't change.
+    Proxy ! {raw_put, Key, Obj},
+    ok.
+
 %% @private
 %% upon receipt of a client-initiated put
 do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
-    case proplists:get_value(bucket_props, Options) of
-        undefined ->
-            BProps = riak_core_bucket:get_bucket(Bucket);
-        BProps ->
-            BProps
-    end,
-    case proplists:get_value(rr, Options, false) of
-        true ->
-            PruneTime = undefined;
-        false ->
-            PruneTime = StartTime
-    end,
+    BProps =  case proplists:get_value(bucket_props, Options) of
+                  undefined ->
+                      riak_core_bucket:get_bucket(Bucket);
+                  Props ->
+                      Props
+              end,
+    PruneTime = case proplists:get_value(rr, Options, false) of
+                    true ->
+                        undefined;
+                    false ->
+                        StartTime
+                end,
     Coord = proplists:get_value(coord, Options, false),
-    CounterOp = proplists:get_value(counter_op, Options, undefined),
+    CRDTOp = proplists:get_value(counter_op, Options, proplists:get_value(crdt_op, Options, undefined)),
     PutArgs = #putargs{returnbody=proplists:get_value(returnbody,Options,false) orelse Coord,
                        coord=Coord,
                        lww=proplists:get_value(last_write_wins, BProps, false),
@@ -1005,15 +1356,17 @@ do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
                        bprops=BProps,
                        starttime=StartTime,
                        prunetime=PruneTime,
-                       counter_op = CounterOp},
-    {PrepPutRes, UpdPutArgs} = prepare_put(State, PutArgs),
-    {Reply, UpdState} = perform_put(PrepPutRes, State, UpdPutArgs),
+                       crdt_op = CRDTOp},
+    {PrepPutRes, UpdPutArgs, State2} = prepare_put(State, PutArgs),
+    {Reply, UpdState} = perform_put(PrepPutRes, State2, UpdPutArgs),
     riak_core_vnode:reply(Sender, Reply),
 
     update_index_write_stats(UpdPutArgs#putargs.is_index, UpdPutArgs#putargs.index_specs),
-    UpdState.
+    {Reply, UpdState}.
 
-do_backend_delete(BKey, RObj, State = #state{mod = Mod, modstate = ModState}) ->
+do_backend_delete(BKey, RObj, State = #state{idx = Idx,
+                                             mod = Mod,
+                                             modstate = ModState}) ->
     %% object is a tombstone or all siblings are tombstones
     %% Calculate the index specs to remove...
     %% JDM: This should just be a tombstone by this point, but better
@@ -1024,7 +1377,9 @@ do_backend_delete(BKey, RObj, State = #state{mod = Mod, modstate = ModState}) ->
     {Bucket, Key} = BKey,
     case Mod:delete(Bucket, Key, IndexSpecs, ModState) of
         {ok, UpdModState} ->
+            ?INDEX(RObj, delete, Idx),
             delete_from_hashtree(Bucket, Key, State),
+            maybe_cache_evict(BKey, State),
             update_index_delete_stats(IndexSpecs),
             State#state{modstate = UpdModState};
         {error, _Reason, UpdModState} ->
@@ -1054,32 +1409,57 @@ prepare_put(State=#state{vnodeid=VId,
             ObjToStore =
                 case Coord of
                     true ->
+                        %% Do we need to use epochs here? I guess we
+                        %% don't care, and since we don't read, we
+                        %% can't.
                         riak_object:increment_vclock(RObj, VId, StartTime);
                     false ->
                         RObj
                 end,
-            {{true, ObjToStore}, PutArgs#putargs{is_index = false}};
+            {{true, ObjToStore}, PutArgs#putargs{is_index = false}, State};
         false ->
             prepare_put(State, PutArgs, IndexBackend)
     end.
-prepare_put(#state{vnodeid=VId,
-                   mod=Mod,
-                   modstate=ModState},
-            PutArgs=#putargs{bkey={Bucket, Key},
+prepare_put(State=#state{mod=Mod,
+                         modstate=ModState,
+                         idx=Idx,
+                         md_cache=MDCache},
+            PutArgs=#putargs{bkey={Bucket, Key}=BKey,
                              robj=RObj,
                              bprops=BProps,
                              coord=Coord,
                              lww=LWW,
                              starttime=StartTime,
                              prunetime=PruneTime,
-                             counter_op = CounterOp},
+                             crdt_op = CRDTOp},
             IndexBackend) ->
+    {CacheClock, CacheData} = maybe_check_md_cache(MDCache, BKey),
+
+    RequiresGet =
+        case CacheClock of
+            undefined ->
+                true;
+            Clock ->
+                %% We need to perform a local get, to merge contents,
+                %% if the local object has events unseen by the
+                %% incoming object. If the incoming object descends
+                %% the cache (i.e. has seen all its events) no need to
+                %% do a local get and merge, just overwrite.
+                not riak_object:vclock_descends(RObj, Clock)
+        end,
     GetReply =
-        case do_get_object(Bucket, Key, Mod, ModState) of
-            {error, not_found, _UpdModState} ->
-                ok;
-            {ok, TheOldObj, _UpdModState} ->
-                {ok, TheOldObj}
+        case RequiresGet of
+            true ->
+                case do_get_object(Bucket, Key, Mod, ModState) of
+                    {error, not_found, _UpdModState} ->
+                        ok;
+                    {ok, TheOldObj, _UpdModState} ->
+                        {ok, TheOldObj}
+                end;
+            false ->
+                FakeObj0 = riak_object:new(Bucket, Key, <<>>),
+                FakeObj = riak_object:set_vclock(FakeObj0, CacheClock),
+                {ok, FakeObj}
         end,
     case GetReply of
         ok ->
@@ -1089,59 +1469,88 @@ prepare_put(#state{vnodeid=VId,
                 false ->
                     IndexSpecs = []
             end,
-            ObjToStore = prepare_new_put(Coord, RObj, VId, StartTime, CounterOp),
-            {{true, ObjToStore}, PutArgs#putargs{index_specs=IndexSpecs, is_index=IndexBackend}};
+            %% local not found, start a per key epoch
+            {EpochId, State2} = new_key_epoch(State),
+            case prepare_new_put(Coord, RObj, EpochId, StartTime, CRDTOp) of
+                {error, E} ->
+                    {{fail, Idx, E}, PutArgs, State2};
+                ObjToStore ->
+                    {{true, ObjToStore},
+                     PutArgs#putargs{index_specs=IndexSpecs,
+                                     is_index=IndexBackend}, State2}
+            end;
         {ok, OldObj} ->
-            case put_merge(Coord, LWW, OldObj, RObj, VId, StartTime) of
+            {ActorId, State2} = maybe_new_key_epoch(Coord, State, OldObj, RObj),
+            case put_merge(Coord, LWW, OldObj, RObj, ActorId, StartTime) of
                 {oldobj, OldObj1} ->
-                    {{false, OldObj1}, PutArgs};
+                    {{false, OldObj1}, PutArgs, State2};
                 {newobj, NewObj} ->
-                    VC = riak_object:vclock(NewObj),
                     AMObj = enforce_allow_mult(NewObj, BProps),
                     IndexSpecs = case IndexBackend of
                                      true ->
-                                         riak_object:diff_index_specs(AMObj,
-                                                             OldObj);
+                                         case CacheData /= undefined andalso
+                                             RequiresGet == false of
+                                             true ->
+                                                 NewData = riak_object:index_data(AMObj),
+                                                 riak_object:diff_index_data(NewData,
+                                                                             CacheData);
+                                             false ->
+                                                 riak_object:diff_index_specs(AMObj,
+                                                                              OldObj)
+                                         end;
                                      false ->
                                          []
-                    end,
+                                 end,
                     ObjToStore = case PruneTime of
                                      undefined ->
                                          AMObj;
                                      _ ->
-                                         riak_object:set_vclock(AMObj,
-                                                                vclock:prune(VC,
-                                                                             PruneTime,
-                                                                             BProps))
-                    end,
-                    ObjToStore2 = handle_counter(Coord, CounterOp, VId, ObjToStore),
-                    {{true, ObjToStore2},
-                     PutArgs#putargs{index_specs=IndexSpecs, is_index=IndexBackend}}
+                                         riak_object:prune_vclock(AMObj, PruneTime, BProps)
+                                 end,
+                    case handle_crdt(Coord, CRDTOp, ActorId, ObjToStore) of
+                        {error, E} ->
+                            {{fail, Idx, E}, PutArgs, State2};
+                        ObjToStore2 ->
+                            {{true, ObjToStore2},
+                             PutArgs#putargs{index_specs=IndexSpecs,
+                                             is_index=IndexBackend}, State2}
+                    end
             end
     end.
 
 %% @Doc in the case that this a co-ordinating put, prepare the object.
-prepare_new_put(true, RObj, VId, StartTime, CounterOp) when is_integer(CounterOp) ->
-    VClockUp = riak_object:increment_vclock(RObj, VId, StartTime),
-    %% coordinating a _NEW_ counter operation means
-    %% creating + incrementing the counter.
-    %% Make a new counter, stuff it in the riak_object
-    riak_kv_counter:update(VClockUp, VId, CounterOp);
-prepare_new_put(true, RObj, VId, StartTime, _CounterOp) ->
+%% NOTE the `VId' is a new epoch actor for this object
+prepare_new_put(true, RObj, VId, StartTime, undefined) ->
     riak_object:increment_vclock(RObj, VId, StartTime);
+prepare_new_put(true, RObj, VId, StartTime, CRDTOp) ->
+    VClockUp = riak_object:increment_vclock(RObj, VId, StartTime),
+    %% coordinating a _NEW_ crdt operation means
+    %% creating + updating the crdt.
+    %% Make a new crdt, stuff it in the riak_object
+    do_crdt_update(VClockUp, VId, CRDTOp);
 prepare_new_put(false, RObj, _VId, _StartTime, _CounterOp) ->
+    %% @TODO Not coordindating, not found local, is there an entry for
+    %% us in the clock? If so, mark as dirty
     RObj.
 
-handle_counter(true, CounterOp, VId, RObj) when is_integer(CounterOp) ->
-    riak_kv_counter:update(RObj, VId, CounterOp);
-handle_counter(false, CounterOp, _Vid, RObj) when is_integer(CounterOp) ->
-    %% non co-ord put, merge the values if there are siblings
-    %% 'cos that is the point of CRDTs / counters: no siblings
-    riak_kv_counter:merge(RObj);
-handle_counter(_Coord, _CounterOp, _VId, RObj) ->
-    %% i.e. not a counter op
+handle_crdt(_, undefined, _VId, RObj) ->
+    RObj;
+handle_crdt(true, CRDTOp, VId, RObj) ->
+    do_crdt_update(RObj, VId, CRDTOp);
+handle_crdt(false, _CRDTOp, _Vid, RObj) ->
     RObj.
 
+do_crdt_update(RObj, VId, CRDTOp) ->
+    {Time, Value} = timer:tc(riak_kv_crdt, update, [RObj, VId, CRDTOp]),
+    ok = riak_kv_stat:update({vnode_dt_update, get_crdt_mod(CRDTOp), Time}),
+    Value.
+
+get_crdt_mod(Int) when is_integer(Int) -> ?COUNTER_TYPE;
+get_crdt_mod(#crdt_op{mod=Mod}) -> Mod;
+get_crdt_mod(Atom) when is_atom(Atom) -> Atom.
+
+perform_put({fail, _, _}=Reply, State, _PutArgs) ->
+    {Reply, State};
 perform_put({false, Obj},
             #state{idx=Idx}=State,
             #putargs{returnbody=true,
@@ -1153,17 +1562,24 @@ perform_put({false, _Obj},
                      reqid=ReqId}) ->
     {{dw, Idx, ReqId}, State};
 perform_put({true, Obj},
-            #state{idx=Idx,
-                   mod=Mod,
-                   modstate=ModState}=State,
+            State,
             #putargs{returnbody=RB,
-                     bkey={Bucket, Key},
+                     bkey=BKey,
                      reqid=ReqID,
                      index_specs=IndexSpecs}) ->
+    {Reply, State2} = actual_put(BKey, Obj, IndexSpecs, RB, ReqID, State),
+    {Reply, State2}.
+
+actual_put(BKey={Bucket, Key}, Obj, IndexSpecs, RB, ReqID,
+           State=#state{idx=Idx,
+                        mod=Mod,
+                        modstate=ModState}) ->
     case encode_and_put(Obj, Mod, Bucket, Key, IndexSpecs, ModState,
-                        do_max_check) of
-        {{ok, UpdModState}, _EncodedVal} ->
-            update_hashtree(Bucket, Key, Obj, State),
+                       do_max_check) of
+        {{ok, UpdModState}, EncodedVal} ->
+            update_hashtree(Bucket, Key, EncodedVal, State),
+            maybe_cache_object(BKey, Obj, State),
+            ?INDEX(Obj, put, Idx),
             case RB of
                 true ->
                     Reply = {dw, Idx, Obj, ReqID};
@@ -1174,6 +1590,12 @@ perform_put({true, Obj},
             Reply = {fail, Idx, Reason}
     end,
     {Reply, State#state{modstate=UpdModState}}.
+
+actual_put_tracked(BKey, Obj, IndexSpecs, RB, ReqId, State) ->
+    StartTS = os:timestamp(),
+    Result = actual_put(BKey, Obj, IndexSpecs, RB, ReqId, State),
+    update_vnode_stats(vnode_put, State#state.idx, StartTS),
+    Result.
 
 do_reformat({Bucket, Key}=BKey, State=#state{mod=Mod, modstate=ModState}) ->
     case do_get_object(Bucket, Key, Mod, ModState) of
@@ -1189,8 +1611,8 @@ do_reformat({Bucket, Key}=BKey, State=#state{mod=Mod, modstate=ModState}) ->
                                reqid=undefined,
                                index_specs=[]},
             case perform_put({true, RObj}, State, PutArgs) of
-                {{fail, _, _}, UpdState}  ->
-                    Reply = {error, backend_error};
+                {{fail, _, Reason}, UpdState}  ->
+                    Reply = {error, Reason};
                 {_, UpdState} ->
                     Reply = ok
             end
@@ -1225,54 +1647,61 @@ select_newest_content(Mult) ->
 
 %% @private
 put_merge(false, true, _CurObj, UpdObj, _VId, _StartTime) -> % coord=false, LWW=true
+    %% @TODO Do we need to mark the clock dirty here? I think so
+    %% @TODO Check the clock of the incoming object, if it is more advanced
+    %% for our actor than we are then something is amiss, and we need
+    %% to mark the actor as dirty for this key
     {newobj, UpdObj};
 put_merge(false, false, CurObj, UpdObj, _VId, _StartTime) -> % coord=false, LWW=false
+    %% a downstream merge, or replication of a coordinated PUT
+    %% Merge the value received with local replica value
+    %% and store the value IFF it is different to what we already have
+    %%
+    %% @TODO Check the clock of the incoming object, if it is more advanced
+    %% for our actor than we are then something is amiss, and we need
+    %% to mark the actor as dirty for this key
     ResObj = riak_object:syntactic_merge(CurObj, UpdObj),
-    case ResObj =:= CurObj of
+    case riak_object:equal(ResObj, CurObj) of
         true ->
             {oldobj, CurObj};
         false ->
             {newobj, ResObj}
     end;
-put_merge(true, true, _CurObj, UpdObj, VId, StartTime) -> % coord=true, LWW=true
-    {newobj, riak_object:increment_vclock(UpdObj, VId, StartTime)};
-put_merge(true, false, CurObj, UpdObj, VId, StartTime) ->
-    UpdObj1 = riak_object:increment_vclock(UpdObj, VId, StartTime),
-    UpdVC = riak_object:vclock(UpdObj1),
-    CurVC = riak_object:vclock(CurObj),
-
-    %% Check the coord put will replace the existing object
-    case vclock:get_counter(VId, UpdVC) > vclock:get_counter(VId, CurVC) andalso
-        vclock:descends(CurVC, UpdVC) == false andalso
-        vclock:descends(UpdVC, CurVC) == true of
-        true ->
-            {newobj, UpdObj1};
-        false ->
-            %% If not, make sure it does
-            {newobj, riak_object:increment_vclock(
-                       riak_object:merge(CurObj, UpdObj1), VId, StartTime)}
-    end.
+put_merge(true, LWW, CurObj, UpdObj, VId, StartTime) ->
+    %% @TODO If the current object has a dirty clock, we need to start
+    %% a new per key epoch and mark clock as clean.
+    {newobj, riak_object:update(LWW, CurObj, UpdObj, VId, StartTime)}.
 
 %% @private
 do_get(_Sender, BKey, ReqID,
-       State=#state{idx=Idx,mod=Mod,modstate=ModState}) ->
+       State=#state{idx=Idx, mod=Mod, modstate=ModState}) ->
     StartTS = os:timestamp(),
-    Retval = do_get_term(BKey, Mod, ModState),
+    {Retval, ModState1} = do_get_term(BKey, Mod, ModState),
+    case Retval of
+        {ok, Obj} ->
+            maybe_cache_object(BKey, Obj, State);
+        _ ->
+            ok
+    end,
     update_vnode_stats(vnode_get, Idx, StartTS),
-    {reply, {r, Retval, Idx, ReqID}, State}.
+    {reply, {r, Retval, Idx, ReqID}, State#state{modstate=ModState1}}.
 
 %% @private
+-spec do_get_term({binary(), binary()}, atom(), tuple()) ->
+                         {{ok, riak_object:riak_object()}, tuple()} |
+                         {{error, notfound}, tuple()} |
+                         {{error, any()}, tuple()}.
 do_get_term({Bucket, Key}, Mod, ModState) ->
     case do_get_object(Bucket, Key, Mod, ModState) of
-        {ok, Obj, _UpdModState} ->
-            {ok, Obj};
+        {ok, Obj, UpdModState} ->
+            {{ok, Obj}, UpdModState};
         %% @TODO Eventually it would be good to
         %% make the use of not_found or notfound
         %% consistent throughout the code.
-        {error, not_found, _UpdatedModstate} ->
-            {error, notfound};
-        {error, Reason, _UpdatedModstate} ->
-            {error, Reason};
+        {error, not_found, UpdModState} ->
+            {{error, notfound}, UpdModState};
+        {error, Reason, UpdModState} ->
+            {{error, Reason}, UpdModState};
         Err ->
             Err
     end.
@@ -1288,20 +1717,20 @@ do_get_binary(Bucket, Key, Mod, ModState) ->
 do_get_object(Bucket, Key, Mod, ModState) ->
     case uses_r_object(Mod, ModState, Bucket) of
         true ->
+            %% Non binary returns do not trigger size warnings
             Mod:get_object(Bucket, Key, false, ModState);
         false ->
             case do_get_binary(Bucket, Key, Mod, ModState) of
                 {ok, ObjBin, _UpdModState} ->
-                    ObjSize = size(ObjBin),
-                    WarnObjSize = app_helper:get_env(riak_kv, warn_object_size),
-                    case ObjSize > WarnObjSize of
+                    BinSize = size(ObjBin),
+                    WarnSize = app_helper:get_env(riak_kv, warn_object_size),
+                    case BinSize > WarnSize of
                         true ->
-                            lager:warning("Reading large object of size ~p from ~p/~p",
-                                          [ObjSize, Bucket, Key]);
+                            lager:warning("Read large object ~p/~p (~p bytes)",
+                                          [Bucket, Key, BinSize]);
                         false ->
                             ok
                     end,
-
                     try
                         case riak_object:from_binary(Bucket, Key, ObjBin) of
                             {error, Reason} ->
@@ -1332,11 +1761,11 @@ list(FoldFun, FinishFun, Mod, ModFun, ModState, Opts, Buffer) ->
     end.
 
 %% @private
-fold_fun(buckets, BufferMod, none) ->
+fold_fun(buckets, BufferMod, none, _Extra) ->
     fun(Bucket, Buffer) ->
             BufferMod:add(Bucket, Buffer)
     end;
-fold_fun(buckets, BufferMod, Filter) ->
+fold_fun(buckets, BufferMod, Filter, _Extra) ->
     fun(Bucket, Buffer) ->
             case Filter(Bucket) of
                 true ->
@@ -1345,16 +1774,41 @@ fold_fun(buckets, BufferMod, Filter) ->
                     Buffer
             end
     end;
-fold_fun(keys, BufferMod, none) ->
+fold_fun(keys, BufferMod, none, undefined) ->
     fun(_, Key, Buffer) ->
             BufferMod:add(Key, Buffer)
     end;
-fold_fun(keys, BufferMod, Filter) ->
+fold_fun(keys, BufferMod, none, {Bucket, Index, N, NumPartitions}) ->
+    fun(_, Key, Buffer) ->
+            Hash = riak_core_util:chash_key({Bucket, Key}),
+            case riak_core_ring:future_index(Hash, Index, N, NumPartitions, NumPartitions) of
+                Index ->
+                    BufferMod:add(Key, Buffer);
+                _ ->
+                    Buffer
+            end
+    end;
+fold_fun(keys, BufferMod, Filter, undefined) ->
     fun(_, Key, Buffer) ->
             case Filter(Key) of
                 true ->
                     BufferMod:add(Key, Buffer);
                 false ->
+                    Buffer
+            end
+    end;
+fold_fun(keys, BufferMod, Filter, {Bucket, Index, N, NumPartitions}) ->
+    fun(_, Key, Buffer) ->
+            Hash = riak_core_util:chash_key({Bucket, Key}),
+            case riak_core_ring:future_index(Hash, Index, N, NumPartitions, NumPartitions) of
+                Index ->
+                    case Filter(Key) of
+                        true ->
+                            BufferMod:add(Key, Buffer);
+                        false ->
+                            Buffer
+                    end;
+                _ ->
                     Buffer
             end
     end.
@@ -1369,6 +1823,21 @@ result_fun(Sender) ->
 result_fun(Bucket, Sender) ->
     fun(Items) ->
             riak_core_vnode:reply(Sender, {Bucket, Items})
+    end.
+
+fold_extras_keys(Index, Bucket) ->
+    case app_helper:get_env(riak_kv, fold_preflist_filter, false) of
+        true ->
+            {ok, R} = riak_core_ring_manager:get_my_ring(),
+            NValMap = nval_map(R),
+            N = case lists:keyfind(Bucket, 1, NValMap) of
+                    false -> riak_core_bucket:default_object_nval();
+                    {Bucket, NVal} -> NVal
+                end,
+            NumPartitions = riak_core_ring:num_partitions(R),
+            {Bucket, Index, N, NumPartitions};
+        false ->
+            undefined
     end.
 
 %% wait for acknowledgement that results were received before
@@ -1412,7 +1881,7 @@ finish_fold(BufferMod, Buffer, Sender) ->
     riak_core_vnode:reply(Sender, done).
 
 %% @private
-do_delete(BKey, ReqId, State) ->
+do_delete(BKey, State) ->
     Mod = State#state.mod,
     ModState = State#state.modstate,
     Idx = State#state.idx,
@@ -1420,46 +1889,44 @@ do_delete(BKey, ReqId, State) ->
 
     %% Get the existing object.
     case do_get_term(BKey, Mod, ModState) of
-        {ok, RObj} ->
+        {{ok, RObj}, UpdModState} ->
             %% Object exists, check if it should be deleted.
             case riak_kv_util:obj_not_deleted(RObj) of
                 undefined ->
                     case DeleteMode of
                         keep ->
                             %% keep tombstones indefinitely
-                            {reply, {fail, Idx, ReqId}, State};
+                            {reply, {fail, Idx, del_mode_keep},
+                             State#state{modstate=UpdModState}};
                         immediate ->
-                            UpdState = do_backend_delete(BKey, RObj, State),
-                            {reply, {del, Idx, ReqId}, UpdState};
+                            UpdState = do_backend_delete(BKey, RObj,
+                                                         State#state{modstate=UpdModState}),
+                            {reply, {del, Idx, del_mode_immediate}, UpdState};
                         Delay when is_integer(Delay) ->
                             erlang:send_after(Delay, self(),
                                               {final_delete, BKey,
                                                delete_hash(RObj)}),
                             %% Nothing checks these messages - will just reply
                             %% del for now until we can refactor.
-                            {reply, {del, Idx, ReqId}, State}
+                            {reply, {del, Idx, del_mode_delayed},
+                             State#state{modstate=UpdModState}}
                     end;
                 _ ->
                     %% not a tombstone or not all siblings are tombstones
-                    {reply, {fail, Idx, ReqId}, State}
+                    {reply, {fail, Idx, not_tombstone}, State#state{modstate=UpdModState}}
             end;
-        _ ->
+        {{error, notfound}, UpdModState} ->
             %% does not exist in the backend
-            {reply, {fail, Idx, ReqId}, State}
+            {reply, {fail, Idx, not_found}, State#state{modstate=UpdModState}}
     end.
 
 %% @private
-do_fold(Fun, Acc0, Sender, State=#state{async_folding=AsyncFolding,
-                                        mod=Mod,
-                                        modstate=ModState}) ->
+do_fold(Fun, Acc0, Sender, ReqOpts, State=#state{async_folding=AsyncFolding,
+                                                 mod=Mod,
+                                                 modstate=ModState}) ->
     {ok, Capabilities} = Mod:capabilities(ModState),
-    AsyncBackend = lists:member(async_fold, Capabilities),
-    case AsyncFolding andalso AsyncBackend of
-        true ->
-            Opts = [async_fold];
-        false ->
-            Opts = []
-    end,
+    Opts0 = maybe_enable_async_fold(AsyncFolding, Capabilities, ReqOpts),
+    Opts = maybe_enable_iterator_refresh(Capabilities, Opts0),
     case Mod:fold_objects(Fun, Acc0, Opts, ModState) of
         {ok, Acc} ->
             {reply, Acc, State};
@@ -1474,6 +1941,26 @@ do_fold(Fun, Acc0, Sender, State=#state{async_folding=AsyncFolding,
     end.
 
 %% @private
+maybe_enable_async_fold(AsyncFolding, Capabilities, Opts) ->
+    AsyncBackend = lists:member(async_fold, Capabilities),
+    case AsyncFolding andalso AsyncBackend of
+        true ->
+            [async_fold|Opts];
+        false ->
+            Opts
+    end.
+
+%% @private
+maybe_enable_iterator_refresh(Capabilities, Opts) ->
+    Refresh = app_helper:get_env(riak_kv, iterator_refresh, true),
+    case Refresh andalso lists:member(iterator_refresh, Capabilities) of
+        true ->
+            Opts;
+        false ->
+            lists:keydelete(iterator_refresh, 1, Opts)
+    end.
+
+%% @private
 do_get_vclocks(KeyList,_State=#state{mod=Mod,modstate=ModState}) ->
     [{BKey, do_get_vclock(BKey,Mod,ModState)} || BKey <- KeyList].
 %% @private
@@ -1485,13 +1972,14 @@ do_get_vclock({Bucket, Key}, Mod, ModState) ->
 
 %% @private
 %% upon receipt of a handoff datum, there is no client FSM
-do_diffobj_put({Bucket, Key}, DiffObj,
+do_diffobj_put({Bucket, Key}=BKey, DiffObj,
                StateData=#state{mod=Mod,
                                 modstate=ModState,
                                 idx=Idx}) ->
     StartTS = os:timestamp(),
     {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
     IndexBackend = lists:member(indexes, Capabilities),
+    maybe_cache_evict(BKey, StateData),
     case do_get_object(Bucket, Key, Mod, ModState) of
         {error, not_found, _UpdModState} ->
             case IndexBackend of
@@ -1506,6 +1994,7 @@ do_diffobj_put({Bucket, Key}, DiffObj,
                     update_hashtree(Bucket, Key, DiffObj, StateData),
                     update_index_write_stats(IndexBackend, IndexSpecs),
                     update_vnode_stats(vnode_put, Idx, StartTS),
+                    ?INDEX(DiffObj, handoff, Idx),
                     InnerRes;
                 {InnerRes, _Val} ->
                     InnerRes
@@ -1531,6 +2020,7 @@ do_diffobj_put({Bucket, Key}, DiffObj,
                             update_hashtree(Bucket, Key, AMObj, StateData),
                             update_index_write_stats(IndexBackend, IndexSpecs),
                             update_vnode_stats(vnode_put, Idx, StartTS),
+                            ?INDEX(AMObj, handoff, Idx),
                             InnerRes;
                         {InnerRes, _EncodedVal} ->
                             InnerRes
@@ -1538,7 +2028,11 @@ do_diffobj_put({Bucket, Key}, DiffObj,
             end
     end.
 
--spec update_hashtree(binary(), binary(), binary(), state()) -> ok.
+-spec update_hashtree(binary(), binary(),
+                      riak_object:riak_object() | binary(),
+                      state()) -> ok.
+update_hashtree(_Bucket, _Key, _RObj, #state{hashtrees=undefined}) ->
+    ok;
 update_hashtree(Bucket, Key, BinObj, State) when is_binary(BinObj) ->
     RObj = riak_object:from_binary(Bucket, Key, BinObj),
     update_hashtree(Bucket, Key, RObj, State);
@@ -1582,92 +2076,26 @@ get_hashtree_token() ->
 -spec max_hashtree_tokens() -> pos_integer().
 max_hashtree_tokens() ->
     app_helper:get_env(riak_kv,
-                       anti_entropy_max_async, 
+                       anti_entropy_max_async,
                        ?DEFAULT_HASHTREE_TOKENS).
 
-%% @private
-%% Get the vnodeid, assigning and storing if necessary
-get_vnodeid(Index) ->
-    F = fun(Status) ->
-                case proplists:get_value(vnodeid, Status, undefined) of
-                    undefined ->
-                        assign_vnodeid(os:timestamp(),
-                                       riak_core_nodeid:get(),
-                                       Status);
-                    VnodeId ->
-                        {VnodeId, Status}
-                end
-        end,
-    update_vnode_status(F, Index). % Returns {ok, VnodeId} | {error, Reason}
-
-%% Assign a unique vnodeid, making sure the timestamp is unique by incrementing
-%% into the future if necessary.
-assign_vnodeid(Now, NodeId, Status) ->
-    {Mega, Sec, _Micro} = Now,
-    NowEpoch = 1000000*Mega + Sec,
-    LastVnodeEpoch = proplists:get_value(last_epoch, Status, 0),
-    VnodeEpoch = erlang:max(NowEpoch, LastVnodeEpoch+1),
-    VnodeId = <<NodeId/binary, VnodeEpoch:32/integer>>,
-    UpdStatus = [{vnodeid, VnodeId}, {last_epoch, VnodeEpoch} |
-                 proplists:delete(vnodeid,
-                                  proplists:delete(last_epoch, Status))],
-    {VnodeId, UpdStatus}.
+%% @private Get the vnodeid, assigning and storing if necessary.  Also
+%% get the current op counter, using the (new?) threshold to assign
+%% and store a new leased counter if needed. NOTE: this is different
+%% to the previous function, as it will now _always_ store a new
+%% status to disk as it will grab a new lease.
+%%
+%%  @TODO document the need for, and invariants of the counter
+-spec get_vnodeid_and_counter(pid(), non_neg_integer(), boolean()) ->
+                                     {ok, {vnodeid(), #counter_state{}}} |
+                                     {error, Reason::term()}.
+get_vnodeid_and_counter(StatusMgr, CounterLeaseSize, UseEpochCounter) ->
+    {ok, {VId, Counter, Lease}} = riak_kv_vnode_status_mgr:get_vnodeid_and_counter(StatusMgr, CounterLeaseSize),
+    {ok, {VId, #counter_state{cnt=Counter, lease=Lease, lease_size=CounterLeaseSize, use=UseEpochCounter}}}.
 
 %% Clear the vnodeid - returns {ok, cleared}
-clear_vnodeid(Index) ->
-    F = fun(Status) ->
-                {cleared, proplists:delete(vnodeid, Status)}
-        end,
-    update_vnode_status(F, Index). % Returns {ok, VnodeId} | {error, Reason}
-
-update_vnode_status(F, Index) ->
-    VnodeFile = vnode_status_filename(Index),
-    ok = filelib:ensure_dir(VnodeFile),
-    case read_vnode_status(VnodeFile) of
-        {ok, Status} ->
-            update_vnode_status2(F, Status, VnodeFile);
-        {error, enoent} ->
-            update_vnode_status2(F, [], VnodeFile);
-        ER ->
-            ER
-    end.
-
-update_vnode_status2(F, Status, VnodeFile) ->
-    case F(Status) of
-        {Ret, Status} -> % No change
-            {ok, Ret};
-        {Ret, UpdStatus} ->
-            case write_vnode_status(UpdStatus, VnodeFile) of
-                ok ->
-                    {ok, Ret};
-                ER ->
-                    ER
-            end
-    end.
-
-vnode_status_filename(Index) ->
-    P_DataDir = app_helper:get_env(riak_core, platform_data_dir),
-    VnodeStatusDir = app_helper:get_env(riak_kv, vnode_status,
-                                        filename:join(P_DataDir, "kv_vnode")),
-    filename:join(VnodeStatusDir, integer_to_list(Index)).
-
-read_vnode_status(File) ->
-    case file:consult(File) of
-        {ok, [Status]} when is_list(Status) ->
-            {ok, proplists:delete(version, Status)};
-        ER ->
-            ER
-    end.
-
-write_vnode_status(Status, File) ->
-    VersionedStatus = [{version, 1} | proplists:delete(version, Status)],
-    TmpFile = File ++ "~",
-    case file:write_file(TmpFile, io_lib:format("~p.", [VersionedStatus])) of
-        ok ->
-            file:rename(TmpFile, File);
-        ER ->
-            ER
-    end.
+clear_vnodeid(StatusMgr) ->
+    riak_kv_vnode_status_mgr:clear_vnodeid(StatusMgr).
 
 %% @private
 wait_for_vnode_status_results([], _ReqId, Acc) ->
@@ -1687,19 +2115,19 @@ wait_for_vnode_status_results(PrefLists, ReqId, Acc) ->
 -spec update_vnode_stats(vnode_get | vnode_put, partition(), erlang:timestamp()) ->
                                 ok.
 update_vnode_stats(Op, Idx, StartTS) ->
-    riak_kv_stat:update({Op, Idx, timer:now_diff( os:timestamp(), StartTS)}).
+    ok = riak_kv_stat:update({Op, Idx, timer:now_diff( os:timestamp(), StartTS)}).
 
 %% @private
 update_index_write_stats(false, _IndexSpecs) ->
     ok;
 update_index_write_stats(true, IndexSpecs) ->
     {Added, Removed} = count_index_specs(IndexSpecs),
-    riak_kv_stat:update({vnode_index_write, Added, Removed}).
+    ok = riak_kv_stat:update({vnode_index_write, Added, Removed}).
 
 %% @private
 update_index_delete_stats(IndexSpecs) ->
     {_Added, Removed} = count_index_specs(IndexSpecs),
-    riak_kv_stat:update({vnode_index_delete, Removed}).
+    ok = riak_kv_stat:update({vnode_index_delete, Removed}).
 
 %% @private
 %% @doc Given a list of index specs, return the number to add and
@@ -1732,7 +2160,7 @@ handoff_data_encoding_method() ->
 %% its encoding method, but if that fails we use the legacy zlib and protocol buffer decoding:
 decode_binary_object(BinaryObject) ->
     try binary_to_term(BinaryObject) of
-        { Method, BinObj } -> 
+        { Method, BinObj } ->
                                 case Method of
                                     encode_raw  -> {B, K, Val} = BinObj,
                                                    BKey = {B, K},
@@ -1748,7 +2176,7 @@ decode_binary_object(BinaryObject) ->
     %% An exception means we have a legacy handoff object:
     catch
         _:_                 -> do_zlib_decode(BinaryObject)
-    end.  
+    end.
 
 do_zlib_decode(BinaryObject) ->
     DecodedObject = zlib:unzip(BinaryObject),
@@ -1806,6 +2234,8 @@ encode_and_put_no_sib_check(Obj, Mod, Bucket, Key, IndexSpecs, ModState,
     DoMaxCheck = MaxCheckFlag == do_max_check,
     case uses_r_object(Mod, ModState, Bucket) of
         true ->
+            %% Non binary returning backends will have to handle size warnings
+            %% and errors themselves.
             Mod:put_object(Bucket, Key, IndexSpecs, Obj, ModState);
         false ->
             ObjFmt = riak_core_capability:get({riak_kv, object_format}, v0),
@@ -1839,101 +2269,424 @@ uses_r_object(Mod, ModState, Bucket) ->
     {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
     lists:member(uses_r_object, Capabilities).
 
+sanitize_bkey({{<<"default">>, B}, K}) ->
+    {B, K};
+sanitize_bkey(BKey) ->
+    BKey.
+
+%% @private
+%% @doc Unless skipping the background manager, try to acquire the per-vnode lock.
+%%      Sets our task meta-data in the lock as 'handoff', which is useful for
+%%      seeing what's holding the lock via @link riak_core_background_mgr:ps/0.
+-spec maybe_get_vnode_lock(SrcPartition::integer(), pid()) -> ok | max_concurrency.
+maybe_get_vnode_lock(SrcPartition, Pid) ->
+    case riak_core_bg_manager:use_bg_mgr(riak_kv, handoff_use_background_manager) of
+        true  ->
+            Lock = ?KV_VNODE_LOCK(SrcPartition),
+            case riak_core_bg_manager:get_lock(Lock, Pid, [{task, handoff}]) of
+                {ok, _Ref} -> ok;
+                max_concurrency -> max_concurrency
+            end;
+        false ->
+            ok
+    end.
+
+%% @private
+%% @doc Query the application environment for 'vnode_lock_concurrency', and
+%%      if it's an integer, use it to set the maximum vnode lock concurrency
+%%      for Idx. If the background manager is not available yet, schedule a
+%%      retry for later. If the application environment variable
+%%      'riak_core/use_background_manager' is false, this code just
+%%      returns ok without registering.
+try_set_vnode_lock_limit(Idx) ->
+    %% By default, register per-vnode concurrency limit "lock" with 1 so that only a
+    %% single participating subsystem can run a vnode fold at a time. Participation is
+    %% voluntary :-)
+    Concurrency = case app_helper:get_env(riak_kv, vnode_lock_concurrency, 1) of
+                      N when is_integer(N) -> N;
+                      _NotNumber -> 1
+                  end,
+    try_set_concurrency_limit(?KV_VNODE_LOCK(Idx), Concurrency).
+
+try_set_concurrency_limit(Lock, Limit) ->
+    try_set_concurrency_limit(Lock, Limit, riak_core_bg_manager:use_bg_mgr()).
+
+try_set_concurrency_limit(_Lock, _Limit, false) ->
+    %% skip background manager
+    ok;
+try_set_concurrency_limit(Lock, Limit, true) ->
+    %% this is ok to do more than once
+    case riak_core_bg_manager:set_concurrency_limit(Lock, Limit) of
+        unregistered ->
+            %% not ready yet, try again later
+            lager:debug("Background manager unavailable. Will try to set: ~p later.", [Lock]),
+            erlang:send_after(250, ?MODULE, {set_concurrency_limit, Lock, Limit});
+        _ ->
+            lager:debug("Registered lock: ~p", [Lock]),
+            ok
+    end.
+
+maybe_check_md_cache(Table, BKey) ->
+    case Table of
+        undefined ->
+            {undefined, undefined};
+        _ ->
+            case ets:lookup(Table, BKey) of
+                [{_TS, BKey, MD}] ->
+                    MD;
+                [] ->
+                    {undefined, undefined}
+            end
+    end.
+
+maybe_cache_object(BKey, Obj, #state{md_cache = MDCache,
+                                     md_cache_size = MDCacheSize}) ->
+    case MDCache of
+        undefined ->
+            ok;
+        _ ->
+            VClock = riak_object:vclock(Obj),
+            IndexData = riak_object:index_data(Obj),
+            insert_md_cache(MDCache, MDCacheSize, BKey, {VClock, IndexData})
+    end.
+
+maybe_cache_evict(BKey, #state{md_cache = MDCache}) ->
+    case MDCache of
+        undefined ->
+            ok;
+        _ ->
+            ets:delete(MDCache, BKey)
+    end.
+
+insert_md_cache(Table, MaxSize, BKey, MD) ->
+    TS = os:timestamp(),
+    case ets:insert(Table, {TS, BKey, MD}) of
+        true ->
+            Size = ets:info(Table, memory),
+            case Size > MaxSize of
+                true ->
+                    trim_md_cache(Table, MaxSize);
+                false ->
+                    ok
+            end
+    end.
+
+trim_md_cache(Table, MaxSize) ->
+    Oldest = ets:first(Table),
+    case Oldest of
+        '$end_of_table' ->
+            ok;
+        BKey ->
+            ets:delete(Table, BKey),
+            Size = ets:info(Table, memory),
+            case Size > MaxSize of
+                true ->
+                    trim_md_cache(Table, MaxSize);
+                false ->
+                    ok
+            end
+    end.
+
+new_md_cache(VId) ->
+    MDCacheName = list_to_atom(?MD_CACHE_BASE ++ integer_to_list(binary:decode_unsigned(VId))),
+    %% ordered set to make sure that the first key is the oldest
+    %% term format is {TimeStamp, Key, ValueTuple}
+    ets:new(MDCacheName, [ordered_set, {keypos,2}]).
+
+%% @private increment the per vnode coordinating put counter,
+%% flushing/leasing if needed
+-spec update_counter(state()) -> state().
+update_counter(State=#state{counter=CounterState}) ->
+    #counter_state{cnt=Counter0} = CounterState,
+    Counter = Counter0 +  1,
+    maybe_lease_counter(State#state{counter=CounterState#counter_state{cnt=Counter}}).
+
+
+%% @private we can never use a counter that is greater or equal to the
+%% one fsynced to disk. If the incremented counter is == to the
+%% current Lease, we must block until the new Lease is stored. If the
+%% current counter is 80% through the current lease, and we have not
+%% asked for a new lease, ask for one.  If we're less than 80% through
+%% the lease, do nothing.  If not yet blocking(equal) and we already
+%% asked for a new lease, do nothing.
+maybe_lease_counter(#state{vnodeid=VId, counter=#counter_state{cnt=Cnt, lease=Lease}})
+  when Cnt > Lease ->
+    %% Holy broken invariant. Log and crash.
+    lager:error("Broken invariant, epoch counter ~p greater than lease ~p for vnode ~p. Crashing.",
+                [Cnt, Lease, VId]),
+    exit(epoch_counter_invariant_broken);
+maybe_lease_counter(State=#state{counter=#counter_state{cnt=Lease, lease=Lease,
+                                                        leasing=true}}) ->
+    %% Block until we get a new lease, or crash the vnode
+    {ok, NewState} = blocking_lease_counter(State),
+    NewState;
+maybe_lease_counter(State=#state{counter=#counter_state{leasing=true}}) ->
+    %% not yet at the blocking stage, waiting on a lease
+    State;
+maybe_lease_counter(State) ->
+    #state{status_mgr_pid=MgrPid, counter=CS=#counter_state{cnt=Cnt, lease=Lease,
+                                                            lease_size=LeaseSize}} = State,
+    %% @TODO (rdb) configurable??
+    %% has more than 80% of the lease been used?
+    CS2 = if (Lease - Cnt) =< 0.2 * LeaseSize  ->
+                  ok = riak_kv_vnode_status_mgr:lease_counter(MgrPid, LeaseSize),
+                  CS#counter_state{leasing=true};
+             ?ELSE ->
+                  CS
+          end,
+    State#state{counter=CS2}.
+
+%% @private by now, we have to be waiting for a lease, or an exit,
+%% from the mgr. Block until we receive a lease. If we get an exit,
+%% retry a number of times. If we get neither in a reasonable time,
+%% return an error.
+-spec blocking_lease_counter(#state{}) ->
+                                    {ok, #state{}} |
+                                    counter_lease_error().
+blocking_lease_counter(State) ->
+    {MaxErrs, MaxTime} = get_counter_wait_values(),
+    blocking_lease_counter(State, {0, MaxErrs, MaxTime}).
+
+-spec blocking_lease_counter(#state{}, {Errors :: non_neg_integer(),
+                                        MaxErrors :: non_neg_integer(),
+                                        TimeRemainingMillis :: non_neg_integer()}
+                            ) ->
+                                    {ok, #state{}} |
+                                    counter_lease_error().
+blocking_lease_counter(_State, {MaxErrs, MaxErrs, _MaxTime}) ->
+    {error, counter_lease_max_errors};
+blocking_lease_counter(State, {ErrCnt, MaxErrors, MaxTime}) ->
+    #state{idx=Index, vnodeid=VId, status_mgr_pid=Pid, counter=CounterState} = State,
+    #counter_state{lease_size=LeaseSize, use=UseEpochCounter} = CounterState,
+    Start = os:timestamp(),
+    receive
+        {'EXIT', Pid, Reason} ->
+            lager:error("Failed to lease counter for ~p : ~p", [Index, Reason]),
+            {ok, NewPid} = riak_kv_vnode_status_mgr:start_link(self(), Index, UseEpochCounter),
+            ok = riak_kv_vnode_status_mgr:lease_counter(NewPid, LeaseSize),
+            NewState = State#state{status_mgr_pid=NewPid},
+            Elapsed = timer:now_diff(os:timestamp(), Start),
+            blocking_lease_counter(NewState, {ErrCnt+1, MaxErrors, MaxTime - Elapsed});
+        {counter_lease, {Pid, VId, NewLease}} ->
+            NewCS = CounterState#counter_state{lease=NewLease, leasing=false},
+            {ok, State#state{counter=NewCS}};
+        {counter_lease, {Pid, NewVId, NewLease}} ->
+            lager:info("New Vnode id for ~p. Epoch counter rolled over.", [Index]),
+            NewCS = CounterState#counter_state{lease=NewLease, leasing=false, cnt=1},
+            {ok, State#state{vnodeid=NewVId, counter=NewCS}}
+    after
+        MaxTime ->
+            {error, counter_lease_timeout}
+    end.
+
+%% @private get the configured values for blocking waiting on
+%% lease/ID. Ensure that non invalid values come in.
+-spec get_counter_wait_values() ->
+                                     {MaxErrors :: non_neg_integer(),
+                                      MaxTime :: non_neg_integer()}.
+get_counter_wait_values() ->
+    MaxErrors = non_neg_env(riak_kv, counter_lease_errors, ?DEFAULT_CNTR_LEASE_ERRS),
+    MaxTime = non_neg_env(riak_kv, counter_lease_timeout, ?DEFAULT_CNTR_LEASE_TO),
+    {MaxErrors, MaxTime}.
+
+%% @private we don't want to crash riak because of a dodgy config
+%% value, and by this point, cuttlefish be praised, we should have
+%% sane values. However, if not, ignore negative values for timeout
+%% and max errors, use the defaults, and log the insanity. Note this
+%% expects the macro configured defaults to be positive integers!
+-spec non_neg_env(atom(), atom(), pos_integer()) -> pos_integer().
+non_neg_env(App, EnvVar, Default) when is_integer(Default),
+                                       Default > 0 ->
+    case app_helper:get_env(App, EnvVar, Default) of
+        N when is_integer(N),
+               N > 0 ->
+            N;
+        X ->
+            lager:warning("Non-integer/Negative integer ~p for vnode counter config ~p."
+                          " Using default ~p",
+                          [X, EnvVar, Default]),
+            Default
+    end.
+
+%% @private to keep put_merge/6 side effect free (as it is exported
+%% for testing) introspect the state and local/incoming objects and
+%% return the actor ID for a put, and possibly updated state. NOTE
+%% side effects, in that the vnode status on disk can change.
+%% Why might we need a new key epoch?
+%% 1. local not found (handled in prepare_put/3
+%% 2. local found, but never acted on this key before (or don't remember it!)
+%% 3. local found, local acted, but incoming has greater count or actor epoch
+%%    This one is tricky, since it indicates some byzantine failure somewhere.
+-spec maybe_new_key_epoch(boolean(), #state{},
+                          riak_object:riak_object(),
+                          riak_object:riak_object()) ->
+                                 {binary(), #state{}}.
+maybe_new_key_epoch(false, State, _, _) ->
+    %% Never add a new key epoch when not coordinating
+    %% @TODO (rdb) need to mark actor as dirty though.
+    {State#state.vnodeid, State};
+maybe_new_key_epoch(true, State=#state{counter=#counter_state{use=false}, vnodeid=VId}, _, _) ->
+    %% Per-Key-Epochs is off, use the base vnodeid
+    {VId, State};
+maybe_new_key_epoch(true, State, LocalObj, IncomingObj) ->
+    #state{vnodeid=VId} = State,
+    %% @TODO (rdb) maybe optimise since highly likey both objects
+    %% share the majority of actors, maybe a single umerged list of
+    %% actors, somehow tagged by local | incoming?
+    case highest_actor(VId, LocalObj) of
+        {undefined, 0, 0} -> %% Not present locally
+            %% Never acted on this object before, new epoch.
+            new_key_epoch(State);
+        {LocalId, LocalEpoch, LocalCntr} -> %% Present locally
+            case highest_actor(VId, IncomingObj) of
+                {_InId, InEpoch, InCntr} when InEpoch > LocalEpoch;
+                                              InCntr > LocalCntr ->
+                    %% In coming actor-epoch or counter greater than
+                    %% local, some byzantine failure, new epoch.
+                    B = riak_object:bucket(LocalObj),
+                    K = riak_object:key(LocalObj),
+
+                    lager:error("Inbound clock entry for ~p in ~p/~p greater than local",
+                               [VId, B, K]),
+                    new_key_epoch(State);
+                _ ->
+                    %% just use local id
+                    %% Return the highest local epoch ID for this
+                    %% key. This may be the pre-epoch ID (i.e. no
+                    %% epoch), which is good, no reason to force a new
+                    %% epoch on all old keys.
+                    {LocalId, State}
+            end
+    end.
+
+%% @private generate an epoch actor, and update the vnode state.
+-spec new_key_epoch(#state{}) -> {EpochActor :: binary(), #state{}}.
+new_key_epoch(State=#state{vnodeid=VId, counter=#counter_state{use=false}}) ->
+    {VId, State};
+new_key_epoch(State) ->
+    NewState=#state{counter=#counter_state{cnt=Cntr}, vnodeid=VId} = update_counter(State),
+    EpochId = key_epoch_actor(VId, Cntr),
+    {EpochId, NewState}.
+
+%% @private generate a new epoch ID for a key
+-spec key_epoch_actor(vnodeid(), pos_integer()) -> binary().
+key_epoch_actor(ActorBin, Cntr) ->
+    <<ActorBin/binary, Cntr:32/integer>>.
+
+%% @private highest actor is the latest/greatest epoch actor for a
+%% key. It is the actor we want to increment for the current event,
+%% given that we are not starting a new epoch for the key.  Must work
+%% with non-epochal and epochal actors.  The return tuple is
+%% `{ActorId, Epoch, Counter}' where `ActorId' is the highest ID
+%% starting with `ActorBase' that has acted on this key, undefined if
+%% never acted before. `KeyEpoch' is the highest epoch for the
+%% `ActorBase'. `Counter' is the greatest event seen by the `VnodeId'.
+-spec highest_actor(binary(), riak_object:riak_object()) ->
+    {ActorId :: binary() | undefined,
+     KeyEpoch :: non_neg_integer(),
+     Counter :: non_neg_integer()}.
+highest_actor(ActorBase, Obj) ->
+    ActorSize = size(ActorBase),
+    Actors = riak_object:all_actors(Obj),
+
+    {Actor, Epoch} = lists:foldl(fun(Actor, {HighestActor, HighestEpoch}) ->
+                                         case Actor of
+                                             <<ActorBase:ActorSize/binary, Epoch:32/integer>>
+                                               when Epoch > HighestEpoch ->
+                                                 {Actor, Epoch};
+                                             %% Since an actor without
+                                             %% an epoch is lower than
+                                             %% an actor with one,
+                                             %% this means in the
+                                             %% unmatched case, `undefined'
+                                             %% through as the highest
+                                             %% actor, and the epoch
+                                             %% (of zero) passes
+                                             %% through too.
+                                             _ ->  {HighestActor, HighestEpoch}
+                                         end
+                                 end,
+                                 {undefined, 0},
+                                 Actors),
+    %% get the greatest event for the highest/latest actor
+    {Actor, Epoch, riak_object:actor_counter(Actor, Obj)}.
+
 -ifdef(TEST).
 
-%% Check assigning a vnodeid twice in the same second
-assign_vnodeid_restart_same_ts_test() ->
-    Now1 = {1314,224520,343446}, %% TS=1314224520
-    Now2 = {1314,224520,345865}, %% as unsigned net-order int <<78,85,121,136>>
-    NodeId = <<1, 2, 3, 4>>,
-    {Vid1, Status1} = assign_vnodeid(Now1, NodeId, []),
-    ?assertEqual(<<1, 2, 3, 4, 78, 85, 121, 136>>, Vid1),
-    %% Simulate clear
-    Status2 = proplists:delete(vnodeid, Status1),
-    %% Reassign
-    {Vid2, _Status3} = assign_vnodeid(Now2, NodeId, Status2),
-    ?assertEqual(<<1, 2, 3, 4, 78, 85, 121, 137>>, Vid2).
+-define(MGR, riak_kv_vnode_status_mgr).
+-define(MAX_INT, 4294967295).
 
-%% Check assigning a vnodeid with a later date
-assign_vnodeid_restart_later_ts_test() ->
-    Now1 = {1000,000000,0}, %% <<59,154,202,0>>
-    Now2 = {2000,000000,0}, %% <<119,53,148,0>>
-    NodeId = <<1, 2, 3, 4>>,
-    {Vid1, Status1} = assign_vnodeid(Now1, NodeId, []),
-    ?assertEqual(<<1, 2, 3, 4, 59,154,202,0>>, Vid1),
-    %% Simulate clear
-    Status2 = proplists:delete(vnodeid, Status1),
-    %% Reassign
-    {Vid2, _Status3} = assign_vnodeid(Now2, NodeId, Status2),
-    ?assertEqual(<<1, 2, 3, 4, 119,53,148,0>>, Vid2).
+%% @private test the vnode and vnode mgr interaction NOTE: sets up and
+%% tearsdown inside the test, the mgr needs the pid of the test
+%% process to send messages. @TODO(rdb) find a better way
+blocking_test_() ->
+    {setup, fun() -> (catch file:delete("undefined/kv_vnode/0")) end,
+     fun(_) -> file:delete("undefined/kv_vnode/0") end,
+     {spawn, [{"Blocking",
+               fun() ->
+                       {ok, Pid} = ?MGR:start_link(self(), 0, true),
+                       {ok, {VId, CounterState}} = get_vnodeid_and_counter(Pid, 100, true),
+                       #counter_state{cnt=Cnt, lease=Leased, lease_size=LS, leasing=L} = CounterState,
+                       ?assertEqual(0, Cnt),
+                       ?assertEqual(100, Leased),
+                       ?assertEqual(100, LS),
+                       ?assertEqual(false, L),
+                       State = #state{vnodeid=VId, status_mgr_pid=Pid, counter=CounterState},
+                       S2=#state{counter=#counter_state{leasing=L2, cnt=C2}} = update_counter(State),
+                       ?assertEqual(false, L2),
+                       ?assertEqual(1, C2),
+                       S3 = lists:foldl(fun(_, S) ->
+                                                update_counter(S)
+                                        end,
+                                        S2,
+                                        lists:seq(1, 98)),
+                       #state{counter=#counter_state{leasing=L3, cnt=C3}} = S3,
+                       ?assertEqual(true, L3),
+                       ?assertEqual(99, C3),
+                       S4 = update_counter(S3),
+                       #state{counter=#counter_state{lease=Leased2, leasing=L4, cnt=C4}} = S4,
+                       ?assertEqual(false, L4),
+                       ?assertEqual(100, C4),
+                       ?assertEqual(200, Leased2),
+                       {ok, cleared} = ?MGR:clear_vnodeid(Pid),
+                       ok = ?MGR:stop(Pid)
+               end}
+             ]
+     }
+    }.
 
-%% Check assigning a vnodeid with a later date - just in case of clock skew
-assign_vnodeid_restart_earlier_ts_test() ->
-    Now1 = {2000,000000,0}, %% <<119,53,148,0>>
-    Now2 = {1000,000000,0}, %% <<59,154,202,0>>
-    NodeId = <<1, 2, 3, 4>>,
-    {Vid1, Status1} = assign_vnodeid(Now1, NodeId, []),
-    ?assertEqual(<<1, 2, 3, 4, 119,53,148,0>>, Vid1),
-    %% Simulate clear
-    Status2 = proplists:delete(vnodeid, Status1),
-    %% Reassign
-    %% Should be greater than last offered - which is the 2mil timestamp
-    {Vid2, _Status3} = assign_vnodeid(Now2, NodeId, Status2),
-    ?assertEqual(<<1, 2, 3, 4, 119,53,148,1>>, Vid2).
-
-%% Test
-vnode_status_test_() ->
-    {setup,
-     fun() ->
-             filelib:ensure_dir("kv_vnode_status_test/.test"),
-             ?cmd("chmod u+rwx kv_vnode_status_test"),
-             ?cmd("rm -rf kv_vnode_status_test"),
-             application:set_env(riak_kv, vnode_status, "kv_vnode_status_test"),
-             ok
-     end,
+%% @private tests that the counter rolls over to 1 when a new vnode id
+%% is assigned
+rollover_test_() ->
+    {setup, fun() -> (catch file:delete("undefined/kv_vnode/0")) end,
      fun(_) ->
-             application:unset_env(riak_kv, vnode_status),
-             ?cmd("chmod u+rwx kv_vnode_status_test"),
-             ?cmd("rm -rf kv_vnode_status_test"),
-             ok
-     end,
-     [?_test(begin % initial create failure
-                 ?cmd("rm -rf kv_vnode_status_test || true"),
-                 ?cmd("mkdir kv_vnode_status_test"),
-                 ?cmd("chmod -w kv_vnode_status_test"),
-                 F = fun([]) ->
-                             {shouldfail, [badperm]}
-                     end,
-                 Index = 0,
-                 ?assertEqual({error, eacces},  update_vnode_status(F, Index))
-             end),
-      ?_test(begin % create successfully
-                 ?cmd("chmod +w kv_vnode_status_test"),
+             file:delete("undefined/kv_vnode/0") end,
+     {spawn, [{"Rollover",
+               fun() ->
+                       {ok, Pid} = ?MGR:start_link(self(), 0, true),
+                       {ok, {VId, CounterState}} = get_vnodeid_and_counter(Pid, ?MAX_INT, true),
+                       #counter_state{cnt=Cnt, lease=Leased, lease_size=LS, leasing=L} = CounterState,
+                       ?assertEqual(0, Cnt),
+                       ?assertEqual((?MAX_INT), Leased),
+                       ?assertEqual((?MAX_INT), LS),
+                       ?assertEqual(false, L),
+                       %% fiddle the counter to the max int size-2
+                       State = #state{vnodeid=VId, status_mgr_pid=Pid, counter=CounterState#counter_state{cnt=(?MAX_INT-2)}},
+                       S2=#state{counter=#counter_state{leasing=L2, cnt=C2}} = update_counter(State),
+                       ?assertEqual(true, L2),
+                       ?assertEqual((?MAX_INT-1), C2),
+                       %% Vnode ID should roll over, and counter reset
+                       #state{vnodeid=VId2, counter=#counter_state{leasing=L3, cnt=C3}} = update_counter(S2),
 
-                 F = fun([]) ->
-                             {created, [created]}
-                     end,
-                 Index = 0,
-                 ?assertEqual({ok, created}, update_vnode_status(F, Index))
-             end),
-      ?_test(begin % update successfully
-                 F = fun([created]) ->
-                             {updated, [updated]}
-                     end,
-                 Index = 0,
-                 ?assertEqual({ok, updated}, update_vnode_status(F, Index))
-             end),
-      ?_test(begin % update failure
-                 ?cmd("chmod 000 kv_vnode_status_test/0"),
-                 ?cmd("chmod 500 kv_vnode_status_test"),
-                 F = fun([updated]) ->
-                             {shouldfail, [updatedagain]}
-                     end,
-                 Index = 0,
-                 ?assertEqual({error, eacces},  update_vnode_status(F, Index))
-             end)
+                       ?assert(VId /= VId2),
+                       ?assertEqual(false, L3),
+                       ?assertEqual(1, C3),
 
-     ]}.
+                       {ok, cleared} = ?MGR:clear_vnodeid(Pid),
+                       ok = ?MGR:stop(Pid)
+               end}
+             ]}
+    }.
 
 dummy_backend(BackendMod) ->
     Ring = riak_core_ring:fresh(16,node()),
@@ -1980,15 +2733,17 @@ list_buckets_test_() ->
              clean_test_dirs(),
              application:start(sasl),
              Env = application:get_all_env(riak_kv),
-             application:start(folsom),
-             riak_core_stat_cache:start_link(),
+	     exometer:start(),
              riak_kv_stat:register_stats(),
+             {ok, _} = riak_core_bg_manager:start(),
+             riak_core_metadata_manager:start_link([{data_dir, "kv_vnode_test_meta"}]),
              Env
      end,
      fun(Env) ->
              riak_core_ring_manager:cleanup_ets(test),
-             riak_core_stat_cache:stop(),
-             application:stop(folsom),
+             riak_kv_test_util:stop_process(riak_core_metadata_manager),
+             riak_kv_test_util:stop_process(riak_core_bg_manager),
+	     exometer:stop(),
              application:stop(sasl),
              [application:unset_env(riak_kv, K) ||
                  {K, _V} <- application:get_all_env(riak_kv)],
@@ -2039,6 +2794,8 @@ list_buckets_test_i(BackendMod) ->
 filter_keys_test() ->
     riak_core_ring_manager:setup_ets(test),
     clean_test_dirs(),
+    riak_core_metadata_manager:start_link([{data_dir, "kv_vnode_test_meta"}]),
+    riak_core_bg_manager:start(),
     {S, B, K} = backend_with_known_key(riak_kv_memory_backend),
     Caller1 = new_result_listener(keys),
     handle_coverage(?KV_LISTKEYS_REQ{bucket=B,
@@ -2059,6 +2816,8 @@ filter_keys_test() ->
     ?assertEqual({ok, []}, results_from_listener(Caller3)),
 
     riak_core_ring_manager:cleanup_ets(test),
+    riak_kv_test_util:stop_process(riak_core_metadata_manager),
+    riak_kv_test_util:stop_process(riak_core_bg_manager),
     flush_msgs().
 
 %% include bitcask.hrl for HEADER_SIZE macro
@@ -2068,6 +2827,8 @@ filter_keys_test() ->
 %% preparation for a write prevents the write from going through.
 bitcask_badcrc_test() ->
     riak_core_ring_manager:setup_ets(test),
+    riak_core_metadata_manager:start_link([{data_dir, "kv_vnode_test_meta"}]),
+    riak_core_bg_manager:start(),
     clean_test_dirs(),
     {S, B, K} = backend_with_known_key(riak_kv_bitcask_backend),
     DataDir = filename:join(bitcask_test_dir(), "0"),
@@ -2084,6 +2845,8 @@ bitcask_badcrc_test() ->
                                    {raw, 456, self()},
                                    S),
     riak_core_ring_manager:cleanup_ets(test),
+    riak_kv_test_util:stop_process(riak_core_metadata_manager),
+    riak_kv_test_util:stop_process(riak_core_bg_manager),
     flush_msgs().
 
 

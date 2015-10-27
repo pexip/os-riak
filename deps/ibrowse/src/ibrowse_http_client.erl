@@ -15,7 +15,9 @@
 %% External exports
 -export([
          start_link/1,
+         start_link/2,
          start/1,
+         start/2,
          stop/1,
          send_req/7
         ]).
@@ -79,10 +81,16 @@
 %% Description: Starts the server
 %%--------------------------------------------------------------------
 start(Args) ->
-    gen_server:start(?MODULE, Args, []).
+    start(Args, []).
+
+start(Args, Options) ->
+    gen_server:start(?MODULE, Args, Options).
 
 start_link(Args) ->
-    gen_server:start_link(?MODULE, Args, []).
+    start_link(Args, []).
+
+start_link(Args, Options) ->
+    gen_server:start_link(?MODULE, Args, Options).
 
 stop(Conn_pid) ->
     case catch gen_server:call(Conn_pid, stop) of
@@ -996,7 +1004,7 @@ chunk_request_body(Body, _ChunkSize, Acc) when is_list(Body) ->
 
 parse_response(<<>>, #state{cur_req = undefined}=State) ->
     State#state{status = idle};
-parse_response(Data, #state{cur_req = undefined}=State) ->
+parse_response(Data, #state{cur_req = undefined}) ->
     do_trace("Data left to process when no pending request. ~1000.p~n", [Data]),
     {error, data_in_status_idle};
 
@@ -1562,6 +1570,7 @@ get_crlf_pos(<<>>, _)                     -> no.
 fmt_val(L) when is_list(L)    -> L;
 fmt_val(I) when is_integer(I) -> integer_to_list(I);
 fmt_val(A) when is_atom(A)    -> atom_to_list(A);
+fmt_val(B) when is_binary(B)    -> B;
 fmt_val(Term)                 -> io_lib:format("~p", [Term]).
 
 crnl() -> "\r\n".

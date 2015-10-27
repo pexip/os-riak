@@ -28,6 +28,7 @@ struct Table::Rep {
   Options options;
   Status status;
   RandomAccessFile* file;
+  uint64_t file_size;
   uint64_t cache_id;
   FilterBlockReader* filter;
   const char* filter_data;
@@ -48,6 +49,10 @@ Status Table::Open(const Options& options,
   }
 
   char footer_space[Footer::kEncodedLength];
+  // stop valgrind uninitialize warning
+  // let footer.DecodeFrom returned status do the talking for read of bad info
+  memset(footer_space, 0, Footer::kEncodedLength);
+
   Slice footer_input;
   Status s = file->Read(size - Footer::kEncodedLength, Footer::kEncodedLength,
                         &footer_input, footer_space);
@@ -73,6 +78,7 @@ Status Table::Open(const Options& options,
     Rep* rep = new Table::Rep;
     rep->options = options;
     rep->file = file;
+    rep->file_size = size;
     rep->metaindex_handle = footer.metaindex_handle();
     rep->index_block = index_block;
     rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
@@ -263,7 +269,7 @@ Iterator* Table::BlockReader(void* arg,
           if (contents.cachable && options.fill_cache) {
             cache_handle = block_cache->Insert(
                 key, block,
-                (block->size() + block_cache->EntryOverheadSize() + sizeof(cache_key_buffer)),
+                (block->size() + /*block_cache->EntryOverheadSize() +*/ sizeof(cache_key_buffer)),
                 &DeleteCachedBlock);
           }
         }
@@ -320,6 +326,8 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k,
         match=(*saver)(arg, block_iter->key(), block_iter->value());
         if (!match && NULL!=filter)
             gPerfCounters->Inc(ePerfBlockFilterFalse);
+        if (match)
+            gPerfCounters->Inc(ePerfBlockValidGet);
       }
 
       s = block_iter->status();
@@ -361,6 +369,13 @@ uint64_t Table::ApproximateOffsetOf(const Slice& key) const {
   return result;
 }
 
+
+uint64_t 
+Table::GetFileSize()
+{
+    return(rep_->file_size);
+};
+
 Block *
 Table::TEST_GetIndexBlock() {return(rep_->index_block);};
 
@@ -369,7 +384,8 @@ Table::TEST_GetIndexBlock() {return(rep_->index_block);};
 size_t
 Table::TableObjectSize()
 {
-    return(sizeof(Table) + sizeof(Table::Rep) + rep_->index_block->size() + rep_->filter_data_size);
+    return(sizeof(Table) + sizeof(Table::Rep) + rep_->index_block->size() + rep_->filter_data_size + rep_->file->ObjectSize()
+           + sizeof(FilterBlockReader) + sizeof(Block));
 };
 
 size_t

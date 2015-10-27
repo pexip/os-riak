@@ -86,31 +86,34 @@ process_stream(_, _, State) ->
 %% Eunit tests
 %% ===================================================================
 setup() ->
-    Deps = resolve_deps(riak_api), %% Implicitly loads apps
+    application:load(lager),
+    application:load(riak_api),
 
-    application:set_env(sasl, sasl_error_logger, {file, "pb_service_test_sasl.log"}),
     error_logger:tty(false),
-    error_logger:logfile({open, "pb_service_test.log"}),
-
     application:set_env(lager, handlers, [{lager_file_backend, [{"pb_service_test.log", debug, 10485760, "$D0", 5}]}]),
     application:set_env(lager, error_logger_redirect, true),
 
-    application:set_env(riak_core, handoff_port, 0),
+    %% Need riak_core.security capability, let's fake it
+    ets:new(riak_capability_ets, [named_table, {read_concurrency, true}]),
+    ets:insert(riak_capability_ets, {{riak_core, security}, false}),
 
     OldListeners = app_helper:get_env(riak_api, pb, [{"127.0.0.1", 8087}]),
     application:set_env(riak_api, pb, [{"127.0.0.1", 32767}]),
 
-    [ application:start(A) || A <- Deps ],
-    riak_core:wait_for_application(riak_api),
+    lager:start(),
+    {ok, Sup} = riak_api_sup:start_link(),
+    unlink(Sup),
     wait_for_port(),
     riak_api_pb_service:register(?MODULE, ?MSGMIN, ?MSGMAX),
     riak_api_pb_service:register(?MODULE, 111),
-    {OldListeners, Deps}.
+    {OldListeners, Sup}.
 
-cleanup({L, Deps}) ->
-    [ application:stop(A) || A <- lists:reverse(Deps), not is_otp_base_app(A) ],
-    wait_for_application_shutdown(riak_api),
+
+cleanup({L, Sup}) ->
+    ets:delete(riak_capability_ets),
+    exit(Sup, normal),
     application:set_env(riak_api, pb, L),
+    application:stop(lager),
     ok.
 
 request_multi(Payloads) when is_list(Payloads) ->
@@ -226,6 +229,20 @@ deregister_during_shutdown_test_() ->
             end)
      }.
 
+swap_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     ?_test(begin
+                ?assertEqual([102|<<"ok">>], request(101, <<>>)),
+                R1 = riak_api_pb_service:swap(pb_dummy_svc, 99, 110),
+                ?assertMatch({error, _}, R1),
+                R2 = riak_api_pb_service:swap(pb_dummy_svc, 99, 109),
+                ?assertEqual(ok, R2),
+                ?assertEqual([102|<<"swap">>], request(101, <<>>))
+            end)}.
+
+
 wait_for_port() ->
     wait_for_port(10000).
 
@@ -256,42 +273,3 @@ wait_for_port(TRef) ->
             lager:debug("PB port is up"),
             ok
     end.
-
-wait_for_application_shutdown(App) ->
-    case lists:keymember(App, 1, application:which_applications()) of
-        true ->
-            timer:sleep(250),
-            wait_for_application_shutdown(App);
-        false ->
-            ok
-    end.
-
-%% The following three functions build a list of dependent
-%% applications. They will not handle circular or mutually-dependent
-%% applications.
-dep_apps(App) ->
-    application:load(App),
-    {ok, Apps} = application:get_key(App, applications),
-    Apps.
-
-all_deps(App, Deps) ->
-    [[ all_deps(Dep, [App|Deps]) || Dep <- dep_apps(App),
-                                    not lists:member(Dep, Deps)], App].
-
-resolve_deps(App) ->
-    DepList = all_deps(App, []),
-    {AppOrder, _} = lists:foldl(fun(A,{List,Set}) ->
-                                        case sets:is_element(A, Set) of
-                                            true ->
-                                                {List, Set};
-                                            false ->
-                                                {List ++ [A], sets:add_element(A, Set)}
-                                        end
-                                end,
-                                {[], sets:new()},
-                                lists:flatten(DepList)),
-    AppOrder.
-
-is_otp_base_app(kernel) -> true;
-is_otp_base_app(stdlib) -> true;
-is_otp_base_app(_) -> false.

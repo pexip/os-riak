@@ -20,7 +20,7 @@
 
 %% @doc Riak KV MapReduce / Riak Pipe Compatibility
 %%
-%% == About using `{modfun, Mod, Fun, Arg}' generator to a MapReduce job ==
+%% == About using {modfun, Mod, Fun, Arg} generator to a MapReduce job ==
 %%
 %% The six methods of specifying input for a MapReduce job are:
 %%
@@ -55,8 +55,8 @@
 %% '''
 %%
 %% This generator function is responsible for using {@link
-%% riak_pipe:queue_work/2} to send any data to the pipe, and it is
-%% responsible for calling {@link riak_pipe:eoi/2} to signal the end
+%% //riak_pipe/riak_pipe:queue_work/2} to send any data to the pipe, and it is
+%% responsible for calling {@link //riak_pipe/riak_pipe:eoi/2} to signal the end
 %% of input.
 %%
 %% == About reduce phase compatibility ==
@@ -108,6 +108,7 @@
 -define(DEFAULT_TIMEOUT, 60000).
 
 -define(SINK_SYNC_PERIOD_DEFAULT, 10).
+-define(USE_RETURN_BODY_TRUE, use_return_body_true).
 
 -export([
          mapred/2,
@@ -140,6 +141,7 @@
 -include_lib("riak_pipe/include/riak_pipe.hrl").
 -include_lib("riak_pipe/include/riak_pipe_log.hrl").
 -include("riak_kv_mrc_sink.hrl").
+-include("riak_kv_index.hrl").
 
 -export_type([map_query_fun/0,
               reduce_query_fun/0,
@@ -248,8 +250,14 @@ mapred_stream(Query) ->
          {{ok, riak_pipe:pipe()}, NumKeeps :: integer()}.
 mapred_stream(Query, Options) when is_list(Options) ->
     NumKeeps = count_keeps_in_query(Query),
-    {riak_pipe:exec(mr2pipe_phases(Query),
-                    [{log, sink},{trace,[error]}]++Options),
+    Phases0 = mr2pipe_phases(Query),
+    TraceOpt = app_helper:get_env(riak_kv, pipe_log_level, [error]),
+    %% This is part of optimization utilizing return_body
+    Phases = case proplists:get_value(?USE_RETURN_BODY_TRUE, Options) of
+                 true -> tl(Phases0);
+                 _ -> Phases0
+             end,
+    {riak_pipe:exec(Phases, [{log, sink},{trace,TraceOpt}]++Options),
      NumKeeps}.
 
 %% @doc Setup the MapReduce plumbing, including separate process to
@@ -262,10 +270,25 @@ mapred_stream(Query, Options) when is_list(Options) ->
 %% context.
 -spec mapred_stream_sink(input(), [query_part()], timeout()) ->
          {ok, #mrc_ctx{}} | {error, term()}.
+mapred_stream_sink({index, _Bucket, <<"$bucket">>, _Start, _End} = Inputs, Query, Timeout) ->
+    %% Optimization exactly when folding whole bucket and using 2i:
+    %% set return_body=true as csbucket does, and omit duplicate read
+    %% from disk by riak_kv_pipe_listkeys and riak_kv_pipe_get.
+    Options = case riak_core_capability:get({riak_kv, mapred_2i_pipe}, false) of
+                  true -> [?USE_RETURN_BODY_TRUE];
+                  _ -> []
+              end,
+    mapred_stream_sink(Inputs, Query, Options, Timeout);
 mapred_stream_sink(Inputs, Query, Timeout) ->
+    mapred_stream_sink(Inputs, Query, [], Timeout).
+
+-spec mapred_stream_sink(input(), [query_part()], list(), timeout()) ->
+                                  {ok, #mrc_ctx{}} | {error, term()}.
+mapred_stream_sink(Inputs, Query, Options0, Timeout) ->
     {ok, Sink} = riak_kv_mrc_sink:start(self(), []),
-    Options = [{sink, #fitting{pid=Sink}},
-               {sink_type, {fsm, sink_sync_period(), infinity}}],
+    Options = Options0 ++
+        [{sink, #fitting{pid=Sink}},
+         {sink_type, {fsm, sink_sync_period(), infinity}}],
     try mapred_stream(Query, Options) of
         {{ok, Pipe}, NumKeeps} ->
             %% catch just in case the pipe or sink has already died
@@ -284,10 +307,9 @@ mapred_stream_sink(Inputs, Query, Timeout) ->
                           timer={Timer,PipeRef},
                           keeps=NumKeeps}}
     catch throw:{badarg, Fitting, Reason} ->
-            riak_kv_mrc_sink:stop(Sink),
+            _ = riak_kv_mrc_sink:stop(Sink),
             {error, {Fitting, Reason}}
     end.
-    
 
 %% The plan functions are useful for seeing equivalent (we hope) pipeline.
 
@@ -366,7 +388,7 @@ mr2pipe_phase({link,Bucket,Tag,Keep}, I, _ConstHash, QueryT)->
 %%    the input key.</li>
 %%    <li>A required {@link riak_kv_mrc_map} to run the given query
 %%    function on that data.</li>
-%%    <li>An optional {@link riak_pipe_w_tee} if `keep=true'.</li>
+%%    <li>An optional {@link //riak_pipe/riak_pipe_w_tee} if `keep=true'.</li>
 %%    <li>An optional {@link riak_kv_w_reduce} if it is determined
 %%    that results should be prereduced before being sent on.</li>
 %% </ol>
@@ -398,6 +420,7 @@ map2pipe(FunSpec, Arg, Keep, I, QueryT) ->
                   _ ->
                       Arg
               end,
+
     [#fitting_spec{name={kvget_map,I},
                    module=riak_kv_pipe_get,
                    chashfun={riak_kv_pipe_get, bkey_chash},
@@ -450,7 +473,7 @@ query_type(Idx, QueryT) ->
 %% <ol>
 %%    <li>A required {@link riak_kv_w_reduce} to run the given query
 %%    function on the input data.</li>
-%%    <li>An optional {@link riak_pipe_w_tee} if `keep=true'.</li>
+%%    <li>An optional {@link //riak_pipe/riak_pipe_w_tee} if `keep=true'.</li>
 %% </ol>
 %%
 %% A constant has is used to get all of the inputs for the reduce to
@@ -478,9 +501,9 @@ reduce2pipe(FunSpec, Arg, Keep, I, Hash) ->
 %% <ol>
 %%    <li>A required {@link riak_kv_pipe_get} to fetch the data for
 %%    the input key.</li>
-%%    <li>A required {@link riak_pipe_w_xform} to perform the link
+%%    <li>A required {@link //riak_pipe/riak_pipe_w_xform} to perform the link
 %%    extraction</li>
-%%    <li>An optional {@link riak_pipe_w_tee} if `keep=true'.</li>
+%%    <li>An optional {@link //riak_pipe/riak_pipe_w_tee} if `keep=true'.</li>
 %% </ol>
 -spec link2pipe(link_match(), link_match(), boolean(),
                 Index :: integer(), Query :: tuple()) ->
@@ -587,6 +610,8 @@ send_inputs(Pipe, BucketKeyList, _Timeout) when is_list(BucketKeyList) ->
     end;
 send_inputs(Pipe, Bucket, Timeout) when is_binary(Bucket) ->
     riak_kv_pipe_listkeys:queue_existing_pipe(Pipe, Bucket, Timeout);
+send_inputs(Pipe, {Type, Bucket}, Timeout) when is_binary(Type), is_binary(Bucket) ->
+    riak_kv_pipe_listkeys:queue_existing_pipe(Pipe, {Type, Bucket}, Timeout);
 send_inputs(Pipe, {Bucket, FilterExprs}, Timeout) ->
     case riak_kv_mapred_filters:build_filter(FilterExprs) of
         {ok, Filters} ->
@@ -607,22 +632,52 @@ send_inputs(Pipe, {index, Bucket, Index, Key}, Timeout) ->
             NewInput = {modfun, riak_index, mapred_index, [Bucket, Query]},
             send_inputs(Pipe, NewInput, Timeout)
     end;
+
 send_inputs(Pipe, {index, Bucket, Index, StartKey, EndKey}, Timeout) ->
     Query = {range, Index, StartKey, EndKey},
     case riak_core_capability:get({riak_kv, mapred_2i_pipe}, false) of
         true ->
+            Query2 = case Index of
+                        %% This head is special optimization to omit
+                        %% listkeys and getting the value.  riak_pipe
+                        %% phases should have been optimized at
+                        %% mapred_stream/2, by replacing
+                        %% riak_kv_pipe_listkeys+riak_kv_pipe_get with
+                        %% riak_kv_pipe_index. See riak_kv_pipe_index
+                        %% for how it handles this output.
+                        <<"$bucket">> ->
+                            ?KV_INDEX_Q{filter_field= <<"$bucket">>,
+                                        start_term=StartKey,
+                                        start_inclusive=true,
+                                        end_term=EndKey,
+                                        end_inclusive=true,
+                                        start_key=StartKey,
+                                        return_body=true};
+                        %% This head is default
+                        _ -> Query
+                    end,
             riak_kv_pipe_index:queue_existing_pipe(
-              Pipe, Bucket, Query, Timeout);
+              Pipe, Bucket, Query2, Timeout);
         _ ->
             NewInput = {modfun, riak_index, mapred_index, [Bucket, Query]},
             send_inputs(Pipe, NewInput, Timeout)
     end;
 send_inputs(Pipe, {search, Bucket, Query}, Timeout) ->
-    NewInput = {modfun, riak_search, mapred_search, [Bucket, Query, []]},
-    send_inputs(Pipe, NewInput, Timeout);
+    case search_module() of
+        {ok, Mod} ->
+            NewInput = {modfun, Mod, mapred_search, [Bucket, Query, []]},
+            send_inputs(Pipe, NewInput, Timeout);
+        {error, _}=Error ->
+            Error
+    end;
 send_inputs(Pipe, {search, Bucket, Query, Filter}, Timeout) ->
-    NewInput = {modfun, riak_search, mapred_search, [Bucket, Query, Filter]},
-    send_inputs(Pipe, NewInput, Timeout);
+    case search_module() of
+        {ok, Mod} ->
+            NewInput = {modfun, Mod, mapred_search, [Bucket, Query, Filter]},
+            send_inputs(Pipe, NewInput, Timeout);
+        {error, _}=Error ->
+            Error
+    end;
 send_inputs(Pipe, {modfun, Mod, Fun, Arg} = Modfun, Timeout) ->
     try Mod:Fun(Pipe, Arg, Timeout) of
         {ok, Bucket, ReqId} ->
@@ -633,6 +688,34 @@ send_inputs(Pipe, {modfun, Mod, Fun, Arg} = Modfun, Timeout) ->
         X:Y ->
             {Modfun, X, Y, erlang:get_stacktrace()}
     end.
+
+%% decide whether yokozuna or riak_search should be used for
+%% {search, ...} inputs
+search_module() ->
+    case {enabled(yokozuna), enabled(riak_search)} of
+        {true, true} ->
+            case application:get_env(riak_kv, mapred_search) of
+                %% being explicit here to help find typo errors earlier
+                {ok, yokozuna} ->
+                    {ok, yokozuna};
+                {ok, riak_search} ->
+                    {ok, riak_search};
+                undefined ->
+                    {ok, riak_search};
+                Other ->
+                    {error, {unknown_mapred_provider, Other}}
+            end;
+        {true, _} ->
+            {ok, yokozuna};
+        {_, true} ->
+            {ok, riak_search};
+        _ ->
+            {error, "search not enabled"}
+    end.
+
+%% riak_search and yokozuna both use an `enabled' appenv setting
+enabled(App) ->
+    {ok, true} == application:get_env(App, enabled).
 
 %% @doc Helper function used to redirect the results of
 %% index/search/etc. queries into the MapReduce pipe.  The function
@@ -833,7 +916,7 @@ cleanup_sink({SinkPid, SinkMon}) when is_pid(SinkPid),
                                       is_reference(SinkMon) ->
     erlang:demonitor(SinkMon, [flush]),
     %% killing the sink should tear down the pipe
-    riak_kv_mrc_sink:stop(SinkPid),
+    _ = riak_kv_mrc_sink:stop(SinkPid),
     %% receive just in case the sink had sent us one last response
     receive #kv_mrc_sink{} -> ok after 0 -> ok end;
 cleanup_sink(undefined) ->
@@ -977,11 +1060,11 @@ example_setup() ->
 example_setup(Num) when Num > 0 ->
     {ok, C} = riak:local_client(),
     C:put(riak_object:new(<<"foo">>, <<"bar">>, <<"what did you expect?">>)),
-    [C:put(riak_object:new(<<"foo">>,
+    _ = [C:put(riak_object:new(<<"foo">>,
                            list_to_binary("bar"++integer_to_list(X)),
                            list_to_binary("bar val "++integer_to_list(X))))
      || X <- lists:seq(1, Num)],
-    [C:put(riak_object:new(<<"foonum">>,
+    _ = [C:put(riak_object:new(<<"foonum">>,
                            list_to_binary("bar"++integer_to_list(X)),
                            X)) ||
         X <- lists:seq(1, Num)],
@@ -1027,7 +1110,7 @@ compat_fun(66856669, 6, Fun) ->
     {ok, fun({ok, Input, _Keydata}, Partition, FittingDetails) ->
                  Results = riak_kv_mrc_map:link_phase(
                              Input, undefined, {Bucket, Tag}),
-                 [ riak_pipe_vnode_worker:send_output(
+                 _ = [ riak_pipe_vnode_worker:send_output(
                      R, Partition, FittingDetails)
                    || R <- Results ],
                  ok;

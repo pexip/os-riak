@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <string>
+#include <memory>
 
 namespace leveldb {
 
@@ -98,7 +99,7 @@ struct Options {
   // Number of open files that can be used by the DB.  You may need to
   // increase this if your database has a large working set (budget
   // one open file per 2MB of working set).
-  //
+  // RIAK: NO LONGER USED
   // Default: 1000
   int max_open_files;
 
@@ -117,6 +118,15 @@ struct Options {
   //
   // Default: 4K
   size_t block_size;
+
+  // Riak specific:  non-zero value activates code to automatically
+  // increase block_size as needed to ensure maximum number of files
+  // are available in the file cache.  The value indicates how many
+  // incremental increases to use between the original block_size
+  // and largest, reasonable block_size.
+  //
+  // Default: 16
+  int block_size_steps;
 
   // Number of keys between restart points for delta encoding of keys.
   // This parameter can be changed dynamically.  Most clients should
@@ -156,14 +166,63 @@ struct Options {
   //  user database.  (User database gets larger cache resources.)
   bool is_internal_db;
 
+  // Riak replacement for max_open_files and block_cache.  This is
+  //  TOTAL memory to be used by leveldb across ALL DATABASES.
+  //  Most recent value seen upon database open, wins.  Zero for default.
+  uint64_t total_leveldb_mem;
+
+  // Riak specific option specifying block cache space that cannot
+  //  be released for page cache use.  The space may still be
+  //  released for file cache.
+  uint64_t block_cache_threshold;
+
+  // Riak option to override most memory modeling and create
+  //  smaller memory footprint for developers.  Helps when
+  //  running large number of databases and multiple VMs. Do
+  //  NOT use this option if making performance measurements.
+  // Default: false
+  bool limited_developer_mem;
+
+  // The size of each MMAped file, choose 0 for the default (20M)
+  uint64_t mmap_size;
+
+  // Riak option to adjust aggressive delete behavior.
+  //  - zero disables aggressive delete
+  //  - positive value indicates how many deletes must exist
+  //     in a file for it to be compacted due to deletes
+  uint64_t delete_threshold;
+
   // Riak specific flag used to indicate when fadvise() management
   // should default to WILLNEED instead of DONTNEED.  Default is false
   bool fadvise_willneed;
+
+  // *****
+  // Riak specific options for establishing two tiers of disk arrays.
+  // All three tier options must be valid for the option to activate.
+  // When active, leveldb directories are constructed using either
+  // the fast or slow prefix followed by the database name given
+  // in the DB::Open call.  (a synonym for "prefix" is "mount")
+  // *****
+
+  // Riak specific option setting the level number at which the
+  // "tiered_slow_prefix" should be used.  Default is zero which
+  // disables the option.  Valid values are 1 to 6.  3 or 4 recommended.
+  unsigned tiered_slow_level;
+
+  // Riak specific option with the path prefix used for "fast" disk
+  // array.  levels 0 to tiered_slow_level-1 use this path prefix
+  std::string tiered_fast_prefix;
+
+  // Riak specific option with the path prefix used for "slow" disk
+  // array.  levels tiered_slow_level through 6 use this path prefix
+  std::string tiered_slow_prefix;
 
   // Create an Options object with default values for all fields.
   Options();
 
   void Dump(Logger * log) const;
+
+private:
 
 };
 
@@ -186,10 +245,18 @@ struct ReadOptions {
   // Default: NULL
   const Snapshot* snapshot;
 
+  // Riak specific flag, currently used within Erlang adaptor
+  //  to enable automatic delete and new of fresh snapshot
+  //  and database iterator objects for long running iterations
+  //  (only supports iterator NEXT operations).
+  // Default: false
+  bool iterator_refresh;
+
   ReadOptions()
   : verify_checksums(true),
       fill_cache(true),
       snapshot(NULL),
+      iterator_refresh(false),
       is_compaction(false),
       env(NULL),
       info_log(NULL)

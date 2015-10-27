@@ -47,9 +47,8 @@ minispade.register('cluster', function() {
   /**
    * @class
    *
-   * ClusterController is responsible for display the list of nodes
-   * in the cluster.  This controller is basically a placeholder and
-   * wrapper around the legacy cluster page until we rewrite it.
+   * ClusterController is responsible for displaying the list of nodes
+   * in the cluster.
    */
   RiakControl.ClusterController = Ember.ObjectController.extend(
     /**
@@ -68,10 +67,22 @@ minispade.register('cluster', function() {
      * @returns {void}
      */
     refresh: function(newCluster, existingCluster, nodeFactory) {
+      var existingCluster = existingCluster || [];
+
+      /*
+       * For every object in newCluster...
+       */
       newCluster.forEach(function(node) {
+
+        /*
+         * Use a unique property to locate the corresponding
+         * object in existingCluster.
+         */
         var exists = existingCluster.findProperty('name', node.name);
 
-        // If it doesn't exist yet, add it.  If it does, update it.
+        /*
+         * If it doesn't exist yet, add it.  If it does, update it.
+         */
         if(exists !== undefined) {
           exists.setProperties(node);
         } else {
@@ -79,14 +90,33 @@ minispade.register('cluster', function() {
         }
       });
 
-      // Iterate the cluster removing nodes that shouldn't
-      // be there.
+      /*
+       * We've already updated corresponding objects and added
+       * new ones. Now we need to remove ones that don't exist in
+       * the new cluster.
+       */
+
       var changesOccurred    = false;
       var replacementCluster = [];
 
+      /*
+       * For every object in the existingCluster...
+       */
       existingCluster.forEach(function(node, i) {
+
+        /*
+         * Use a unique property to locate the corresponding object
+         * in newCluster.
+         */
         var exists = newCluster.findProperty('name', node.name);
 
+        /*
+         * If it doesn't exist in the newCluster, destroy it.
+         * If this happens even one time, we'll mark changesOccurred as true.
+         *
+         * Otherwise, this node is a good node and we can add it to
+         * the replacementCluster.
+         */
         if(exists === undefined) {
           node.destroy();
           changesOccurred = true;
@@ -95,10 +125,26 @@ minispade.register('cluster', function() {
         }
       });
 
+      /*
+       * If we ended up having to remove any nodes,
+       * replace the cluster.
+       */
       if(changesOccurred) {
         existingCluster.set('[]', replacementCluster.get('[]'));
       }
     },
+
+    /**
+     * If we have tried and been unable to load data, this will
+     * be set to true.
+     */
+    cannotLoad: function () {
+      var content = this.get('content');
+      if (!content) {
+        return false;
+      }
+      return !content.currentCluster.length;
+    }.property('content'),
 
     /**
      * Load data from server.
@@ -108,47 +154,84 @@ minispade.register('cluster', function() {
     load: function() {
       var self = this;
 
-      $.ajax({
-        type:     'GET',
-        url:      '/admin/cluster',
-        dataType: 'json',
+      return new Ember.RSVP.Promise(function(resolve, reject) {
+        $.ajax({
+          type:     'GET',
+          url:      '/admin/cluster',
+          dataType: 'json'
+        }).then(
 
-        success: function(d) {
-          var updatedCurrentCluster = d.cluster.current;
-          var currentCurrentCluster = self.get('content.currentCluster');
+          // success...
+          function(d) {
+            Ember.run(function() {
+              /*
+               * Instantiate content if it hasn't been created yet.
+               */
+              var content = self.get('content');
+              if (!content) {
+                self.set('content', RiakControl.CurrentAndPlannedCluster.create({
+                  stagedCluster: [],
+                  currentCluster: []
+                }));
+              }
+              var updatedCurrentCluster = d.cluster.current;
+              var currentCurrentCluster = self.get('content.currentCluster');
 
-          self.refresh(updatedCurrentCluster,
-            currentCurrentCluster, RiakControl.CurrentClusterNode);
+              self.refresh(updatedCurrentCluster,
+                currentCurrentCluster, RiakControl.CurrentClusterNode);
 
-          var updatedStagedCluster = d.cluster.staged;
+              var updatedStagedCluster = d.cluster.staged;
 
-          if(updatedStagedCluster === 'ring_not_ready') {
-            self.set('ringNotReady', true);
-          } else {
-            self.set('ringNotReady', false);
+              if(updatedStagedCluster === 'ring_not_ready') {
+                self.set('ringNotReady', true);
+              } else {
+                self.set('ringNotReady', false);
+              }
+
+              if(updatedStagedCluster === 'legacy') {
+                self.set('legacyRing', true);
+              } else {
+                self.set('legacyRing', false);
+              }
+
+              if($.isArray(updatedStagedCluster)) {
+                var currentStagedCluster = self.get('content.stagedCluster');
+
+                self.refresh(updatedStagedCluster,
+                  currentStagedCluster, RiakControl.StagedClusterNode);
+              }
+              resolve();
+            });
+          },
+
+          // error...
+          function (jqXHR, textStatus, errorThrown) {
+            Ember.run(function() {
+              /*
+               * Instantiate content if it hasn't been created yet.
+               */
+              var content = self.get('content');
+              if (!content) {
+                self.set('content', RiakControl.CurrentAndPlannedCluster.create({
+                  stagedCluster: [],
+                  currentCluster: []
+                }));
+              }
+
+              if(jqXHR.status === 404 || jqXHR.status === 0) {
+                self.get('displayError')
+                    .call(self,
+                          undefined,
+                          undefined,
+                          "The node hosting Riak Control is unavailable.");
+              } else {
+                self.get('displayError')
+                    .call(self, jqXHR, textStatus, errorThrown);
+              }
+              reject();
+            });
           }
-
-          if(updatedStagedCluster === 'legacy') {
-            self.set('legacyRing', true);
-          } else {
-            self.set('legacyRing', false);
-          }
-
-          if($.isArray(updatedStagedCluster)) {
-            var currentStagedCluster = self.get('content.stagedCluster');
-
-            self.refresh(updatedStagedCluster,
-              currentStagedCluster, RiakControl.StagedClusterNode);
-          }
-        },
-
-        error: function (jqXHR, textStatus, errorThrown) {
-          if(jqXHR.status === 404 || jqXHR.status === 0) {
-            self.get('displayError').call(self, undefined, undefined, "The node hosting Riak Control is unavailable.");
-          } else {
-            self.get('displayError').call(self, jqXHR, textStatus, errorThrown);
-          }
-        }
+        );
       });
     },
 
@@ -221,63 +304,71 @@ minispade.register('cluster', function() {
       return this.get('content.stagedCluster').filterProperty('isDestroyed', false);
     }.property('content.stagedCluster', 'content.stagedCluster.@each'),
 
-    commitPlan: function(ev) {
-      ev.preventDefault();
+    actions: {
+      commitPlan: function() {
+        var self = this;
+        var confirmed = $(document).find("[name='confirmed']:checked").val();
+        var ajax;
 
-      var self = this;
-      var confirmed = $(document).find("[name='confirmed']:checked").val();
+        if(confirmed) {
+          ajax = $.ajax({
+            type:     'POST',
+            url:      '/admin/cluster',
+            dataType: 'json'
+          });
 
-      if(confirmed) {
-        $.ajax({
-          type:     'POST',
-          url:      '/admin/cluster',
-          dataType: 'json',
-          success:  function(d) { self.reload(); },
-          error:    function (jqXHR, textStatus, errorThrown) {
+          ajax.then(
+            // success...
+            function(d) { self.reload(); },
+            // error...
+            function (jqXHR, textStatus, errorThrown) {
+              self.get('displayError')
+                  .call(self, jqXHR, textStatus, errorThrown);
+            }
+          );
+        } else {
+          self.get('displayError').call(self, undefined, undefined, "Please confirm the plan.");
+        }
+      },
+
+      /**
+       * Clear the currently staged cluster plan.
+       *
+       * @returns {void}
+       */
+      clearPlan: function() {
+        var self = this,
+            ajax = $.ajax({
+              type:     'DELETE',
+              url:      '/admin/cluster',
+              dataType: 'json'
+            });
+
+        ajax.then(
+          // success...
+          function(d) { self.reload(); },
+          // error...
+          function (jqXHR, textStatus, errorThrown) {
             self.get('displayError').call(self, jqXHR, textStatus, errorThrown);
           }
-        });
-      } else {
-        self.get('displayError')(undefined, undefined, "Please confirm the plan.");
+        );
+
+      },
+
+      /**
+       * Join a node.
+       *
+       * @returns {void}
+       */
+      joinNode: function() {
+        var self    = this;
+        var node    = this.get('joinNodeField');
+        var success = function() {
+          self.set('joinNodeField', undefined);
+        };
+
+        this.send('stageChange', node, "join", "", success, undefined);
       }
-    },
-
-    /**
-     * Clear the currently staged cluster plan.
-     *
-     * @returns {void}
-     */
-    clearPlan: function(ev) {
-      ev.preventDefault();
-
-      var self = this;
-
-      $.ajax({
-        type:     'DELETE',
-        url:      '/admin/cluster',
-        dataType: 'json',
-        success:  function(d) { self.reload(); },
-        error:    function (jqXHR, textStatus, errorThrown) {
-          self.get('displayError').call(self, jqXHR, textStatus, errorThrown);
-        }
-      });
-    },
-
-    /**
-     * Join a node.
-     *
-     * @returns {void}
-     */
-    joinNode: function(ev) {
-      ev.preventDefault();
-
-      var self    = this;
-      var node    = this.get('joinNodeField');
-      var success = function() {
-        self.set('joinNodeField', undefined);
-      };
-
-      this.stageChange(node, "join", "", success, undefined);
     },
 
     /**
@@ -302,8 +393,8 @@ minispade.register('cluster', function() {
    */
   RiakControl.JoinNodeView = Ember.TextField.extend(
     /** @scope RiakControl.JoinNodeView.prototype */ {
-    valueBinding: 'controller.joinNodeField',
     classNames: ['gui-input', 'gui-text'],
+    joinNode: 'joinNode',
 
     /**
      * When the user presses the enter/return key in the
@@ -315,9 +406,8 @@ minispade.register('cluster', function() {
      * @returns {void}
      */
     keyUp: function (ev) {
-      var controller = this.get('controller');
       if(ev.keyCode === 13){
-        controller.get('joinNode').call(controller, ev);
+        this.sendAction('joinNode');
       }
     }
   });
@@ -385,38 +475,38 @@ minispade.register('cluster', function() {
 
     classNameBindings:  ['expanded:open'],
 
-    /**
-     * Stage a change for a given node.
-     *
-     * @returns {void}
-     */
-    stageChange: function(ev) {
-      ev.preventDefault();
+    actions: {
+      /**
+       * Stage a change for a given node.
+       *
+       * @returns {void}
+       */
+      stageChange: function() {
+        var self = this;
+        var controller = this.get('controller');
 
-      var self = this;
-      var controller = this.get('controller');
+        var name = this.get('name');
 
-      var name = this.get('name');
+        var action = this.$().
+          find("input[type='radio']:checked").val();
+        var forced = this.$().
+          find("input[type='checkbox']:checked").val();
+        var replacement = this.$().
+          find(".replacement-node-dropdown select").val();
 
-      var action = this.$().
-        find("input[type='radio']:checked").val();
-      var forced = this.$().
-        find("input[type='checkbox']:checked").val();
-      var replacement = this.$().
-        find("input[type='select']:selected").val();
+        // Make sure we handle the force replace correctly.
+        //
+        if(action === 'replace' && forced === 'true') {
+          action = 'force_replace';
+        }
 
-      // Make sure we handle the force replace correctly.
-      //
-      if(action === 'replace' && forced === 'true') {
-        action = 'force_replace';
+        // Empty string instead of undefined for null.
+        if(replacement === undefined) {
+          replacement = '';
+        }
+
+        controller.send('stageChange', name, action, replacement);
       }
-
-      // Empty string instead of undefined for null.
-      if(replacement === undefined) {
-        replacement = '';
-      }
-
-      controller.stageChange(name, action, replacement);
     },
 
     /**

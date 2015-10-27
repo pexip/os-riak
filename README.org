@@ -36,6 +36,8 @@ strategies, and more, please visit our docs at http://docs.basho.com/.
 
 ** Building Riak
 
+   Note: the `develop` branch currently only supports Erlang R16B02.
+
    Assuming you have a working Erlang (R14B02 or later) installation,
    building Riak should be as simple as:
 
@@ -289,7 +291,7 @@ strategies, and more, please visit our docs at http://docs.basho.com/.
 
 To report a bug or issue, please open a [[https://github.com/basho/riak/issues][new issue]] against this repository. 
 
-You can read the [[http://docs.basho.com/riak/latest/references/appendices/community/How-to-Report-a-Bug/][full guidelines for bug reporting and code contributions]] on the Riak Docs. 
+You can read the [[http://docs.basho.com/riak/latest/community/bugs/][full guidelines for bug reporting and code contributions]] on the Riak Docs. 
 
 ** Testing
   To make sure your patch works, be sure to run the test suite in each
@@ -297,7 +299,7 @@ You can read the [[http://docs.basho.com/riak/latest/references/appendices/commu
   detect static code errors.
 
   To run the QuickCheck properties included in Riak sub-projects,
-  download QuickCheck Mini: http://quviq.com/downloads.htm NOTE: Some
+  download QuickCheck Mini: http://quviq.com/index.html NOTE: Some
   properties that require features in the Full version will fail.
 
 *** Running unit tests

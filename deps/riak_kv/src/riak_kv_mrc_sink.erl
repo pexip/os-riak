@@ -293,6 +293,7 @@ handle_info({'DOWN', _, process, Pid, Reason}, _,
     %% don't stop when the builder exits 'normal', because that's
     %% probably just the pipe shutting down normally - wait for the
     %% owner to ask for the last outputs
+    _ = lager:warning("Pipe builder down. Reason: ~p", [Reason]),
     {stop, normal, State};
 handle_info(_, StateName, State) ->
     {next_state, StateName, State}.
@@ -328,7 +329,7 @@ send_to_owner(#state{owner=Owner, ref=Ref,
                          results=finish_results(Results),
                          logs=lists:reverse(Logs),
                          done=Done},
-    [ gen_fsm:reply(From, ok) || From <- Delayed ],
+    _ = [ gen_fsm:reply(From, ok) || From <- Delayed ],
     State#state{results=[], logs=[],
                 buffer_left=Max, delayed_acks=[]}.
 

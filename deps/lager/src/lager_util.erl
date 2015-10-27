@@ -353,17 +353,16 @@ calculate_next_rotation([{date, Date}|T], {{Year, Month, Day}, _} = Now) ->
     NewNow = calendar:gregorian_seconds_to_datetime(Seconds),
     calculate_next_rotation(T, NewNow).
 
-
+-spec trace_filter(Query :: 'none' | [tuple()]) -> {ok, any()}.
 trace_filter(Query) ->
     trace_filter(?DEFAULT_TRACER, Query).
 
 %% TODO: Support multiple trace modules 
+%-spec trace_filter(Module :: atom(), Query :: 'none' | [tuple()]) -> {ok, any()}.
 trace_filter(Module, Query) when Query == none; Query == [] ->
-    trace_filter(Module, glc:null(false));
+    {ok, _} = glc:compile(Module, glc:null(false));
 trace_filter(Module, Query) when is_list(Query) ->
-    trace_filter(Module, glc_lib:reduce(trace_any(Query)));
-trace_filter(Module, Query) ->
-    {ok, _} = glc:compile(Module, Query).
+    {ok, _} = glc:compile(Module, glc_lib:reduce(trace_any(Query))).
 
 validate_trace({Filter, Level, {Destination, ID}}) when is_tuple(Filter); is_list(Filter), is_atom(Level), is_atom(Destination) ->
     case validate_trace({Filter, Level, Destination}) of
@@ -392,6 +391,7 @@ validate_trace_filter(Filter) when is_tuple(Filter), is_atom(element(1, Filter))
     false;
 validate_trace_filter(Filter) ->
         case lists:all(fun({Key, '*'}) when is_atom(Key) -> true; 
+                          ({Key, '!'}) when is_atom(Key) -> true;
                           ({Key, _Value})      when is_atom(Key) -> true;
                           ({Key, '=', _Value}) when is_atom(Key) -> true;
                           ({Key, '<', _Value}) when is_atom(Key) -> true;
@@ -416,6 +416,8 @@ trace_acc([], Acc) ->
 	lists:reverse(Acc);
 trace_acc([{Key, '*'}|T], Acc) ->
 	trace_acc(T, [glc:wc(Key)|Acc]);
+trace_acc([{Key, '!'}|T], Acc) ->
+	trace_acc(T, [glc:nf(Key)|Acc]);
 trace_acc([{Key, Val}|T], Acc) ->
 	trace_acc(T, [glc:eq(Key, Val)|Acc]);
 trace_acc([{Key, '=', Val}|T], Acc) ->
@@ -585,6 +587,7 @@ rotate_file_fail_test() ->
     ok.
 
 check_trace_test() ->
+    lager:start(),
     trace_filter(none),
     %% match by module
     ?assertEqual([foo], check_traces([{module, ?MODULE}], ?EMERGENCY, [
@@ -625,7 +628,8 @@ check_trace_test() ->
                 {[{module, '*'}], config_to_mask('!=info'), anythingbutinfo},
                 {[{module, '*'}], config_to_mask('!=notice'), anythingbutnotice}
                 ], [])),
-
+    application:stop(lager),
+    application:stop(goldrush),
     ok.
 
 is_loggable_test_() ->

@@ -1,4 +1,6 @@
-[![Build Status](https://secure.travis-ci.org/eproxus/meck.png)](http://travis-ci.org/eproxus/meck)
+[![Release](http://img.shields.io/github/release/eproxus/meck.svg)](https://github.com/eproxus/meck/releases/latest)
+[![Build Status](http://img.shields.io/travis/eproxus/meck.svg)](http://travis-ci.org/eproxus/meck)
+[![Code Climate](http://img.shields.io/badge/code_climate-17.0-brightgreen.svg)](https://travis-ci.org/eproxus/meck)
 
 Meck
 ====
@@ -35,7 +37,7 @@ Here's an example of using Meck in the Erlang shell:
 
 ```erl
 Eshell V5.8.4  (abort with ^G)
-1> meck:new(dog).
+1> meck:new(dog, [non_strict]). % non_strict is used to create modules that don't exist
 ok
 2> meck:expect(dog, bark, fun() -> "Woof!" end).
 ok
