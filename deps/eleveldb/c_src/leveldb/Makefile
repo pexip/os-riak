@@ -35,6 +35,7 @@ TESTS = \
 	bloom_test \
 	c_test \
 	cache_test \
+	cache2_test \
 	coding_test \
 	corruption_test \
 	crc32c_test \
@@ -43,8 +44,10 @@ TESTS = \
 	env_test \
 	filename_test \
 	filter_block_test \
+	flexcache_test \
 	log_test \
 	memenv_test \
+	perf_count_test \
 	skiplist_test \
 	table_test \
 	version_edit_test \
@@ -129,6 +132,9 @@ c_test: db/c_test.o $(LIBOBJECTS) $(TESTHARNESS)
 cache_test: util/cache_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(CXX) util/cache_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
 
+cache2_test: util/cache2_test.o $(LIBOBJECTS) $(TESTHARNESS)
+	$(CXX) util/cache2_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
+
 coding_test: util/coding_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(CXX) util/coding_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
 
@@ -153,6 +159,9 @@ filename_test: db/filename_test.o $(LIBOBJECTS) $(TESTHARNESS)
 filter_block_test: table/filter_block_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(CXX) table/filter_block_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
 
+flexcache_test: util/flexcache_test.o $(LIBOBJECTS) $(TESTHARNESS)
+	$(CXX) util/flexcache_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
+
 log_test: db/log_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(CXX) db/log_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
 
@@ -161,6 +170,9 @@ table_test: table/table_test.o $(LIBOBJECTS) $(TESTHARNESS)
 
 skiplist_test: db/skiplist_test.o $(LIBOBJECTS) $(TESTHARNESS)
 	$(CXX) db/skiplist_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
+
+perf_count_test: util/perf_count_test.o $(LIBOBJECTS) $(TESTHARNESS)
+	$(CXX) util/perf_count_test.o $(LIBOBJECTS) $(TESTHARNESS) -o $@ $(LDFLAGS)
 
 perf_dump: tools/perf_dump.o $(LIBOBJECTS)
 	$(CXX) tools/perf_dump.o $(LIBOBJECTS) -o $@ $(LDFLAGS)

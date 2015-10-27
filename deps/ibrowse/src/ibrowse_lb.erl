@@ -16,7 +16,7 @@
 %% External exports
 -export([
 	 start_link/1,
-	 spawn_connection/5,
+	 spawn_connection/6,
          stop/1
 	]).
 
@@ -81,13 +81,14 @@ init([Host, Port]) ->
 spawn_connection(Lb_pid, Url,
 		 Max_sessions,
 		 Max_pipeline_size,
-		 SSL_options)
+		 SSL_options,
+		 Process_options)
   when is_pid(Lb_pid),
        is_record(Url, url),
        is_integer(Max_pipeline_size),
        is_integer(Max_sessions) ->
     gen_server:call(Lb_pid,
-		    {spawn_connection, Url, Max_sessions, Max_pipeline_size, SSL_options}).
+		    {spawn_connection, Url, Max_sessions, Max_pipeline_size, SSL_options, Process_options}).
 
 stop(Lb_pid) ->
     case catch gen_server:call(Lb_pid, stop) of
@@ -123,19 +124,19 @@ handle_call(_, _From, #state{proc_state = shutting_down} = State) ->
     {reply, {error, shutting_down}, State};
 
 %% Update max_sessions in #state with supplied value
-handle_call({spawn_connection, _Url, Max_sess, Max_pipe, _}, _From,
-	    #state{num_cur_sessions = Num} = State) 
+handle_call({spawn_connection, _Url, Max_sess, Max_pipe, _, _}, _From,
+	    #state{num_cur_sessions = Num} = State)
     when Num >= Max_sess ->
     State_1 = maybe_create_ets(State),
     Reply = find_best_connection(State_1#state.ets_tid, Max_pipe),
     {reply, Reply, State_1#state{max_sessions = Max_sess,
                                  max_pipeline_size = Max_pipe}};
 
-handle_call({spawn_connection, Url, Max_sess, Max_pipe, SSL_options}, _From,
+handle_call({spawn_connection, Url, Max_sess, Max_pipe, SSL_options, Process_options}, _From,
 	    #state{num_cur_sessions = Cur} = State) ->
     State_1 = maybe_create_ets(State),
     Tid = State_1#state.ets_tid,
-    {ok, Pid} = ibrowse_http_client:start_link({Tid, Url, SSL_options}),
+    {ok, Pid} = ibrowse_http_client:start_link({Tid, Url, SSL_options}, Process_options),
     ets:insert(Tid, {Pid, 0, 0}),
     {reply, {ok, Pid}, State_1#state{num_cur_sessions = Cur + 1,
                                      max_sessions = Max_sess,
@@ -230,7 +231,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 find_best_connection(Tid, Max_pipe) ->
+    ets:safe_fixtable(Tid, true),
     Res = find_best_connection(ets:first(Tid), Tid, Max_pipe),
+    ets:safe_fixtable(Tid, false),
     Res.
 
 find_best_connection('$end_of_table', _, _) ->
@@ -239,9 +242,14 @@ find_best_connection(Pid, Tid, Max_pipe) ->
     case ets:lookup(Tid, Pid) of
         [{Pid, Cur_sz, Speculative_sz}] when Cur_sz < Max_pipe,
                                              Speculative_sz < Max_pipe ->
-            ets:update_counter(Tid, Pid, {3, 1, 9999999, 9999999}),
-            {ok, Pid};
-        _ ->
+            case catch ets:update_counter(Tid, Pid, {3, 1, 9999999, 9999999}) of
+                {'EXIT', _} ->
+                    %% The selected process has shutdown
+                    find_best_connection(ets:next(Tid, Pid), Tid, Max_pipe);
+                _ ->
+                    {ok, Pid}
+            end;
+         _ ->
             find_best_connection(ets:next(Tid, Pid), Tid, Max_pipe)
     end.
 

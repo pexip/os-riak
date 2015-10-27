@@ -1,13 +1,21 @@
-all: deps compile
+.PHONY : all doc clean eunit release xref
+
+all: compile
 
 compile:
 	@./rebar compile escriptize
 
-deps:
-	@./rebar get-deps
-
 clean:
 	@./rebar clean
 
-distclean: clean
-	@./rebar delete-deps
+eunit:
+	@./rebar eunit
+
+xref: all
+	@./rebar xref
+
+release: xref eunit
+	./release.sh
+
+docs:
+	@./rebar doc skip_deps=true

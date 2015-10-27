@@ -453,6 +453,10 @@ void leveldb_options_set_compression(leveldb_options_t* opt, int t) {
   opt->rep.compression = static_cast<CompressionType>(t);
 }
 
+void leveldb_options_set_total_leveldb_mem(leveldb_options_t* opt, size_t s) {
+  opt->rep.total_leveldb_mem = s;
+}
+
 leveldb_comparator_t* leveldb_comparator_create(
     void* state,
     void (*destructor)(void*),
@@ -581,6 +585,10 @@ leveldb_env_t* leveldb_create_default_env() {
 void leveldb_env_destroy(leveldb_env_t* env) {
   if (!env->is_default) delete env->rep;
   delete env;
+}
+
+void leveldb_env_shutdown() {
+  Env::Shutdown();
 }
 
 }  // end extern "C"

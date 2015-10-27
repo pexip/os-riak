@@ -58,7 +58,12 @@ init() ->
 
 %% @doc decode/2 callback. Decodes an incoming message.
 decode(Code, Bin) ->
-    {ok, riak_pb_codec:decode(Code, Bin)}.
+    Msg = riak_pb_codec:decode(Code, Bin),
+    case Msg of
+        #rpbindexreq{type=T, bucket=B} ->
+            Bucket = bucket_type(T, B),
+            {ok, Msg, {"riak_kv.index", Bucket}}
+    end.
 
 %% @doc encode/1 callback. Encodes an outgoing response message.
 encode(Message) ->
@@ -102,12 +107,11 @@ process(#rpbindexreq{} = Req, State) ->
             maybe_perform_query(QueryVal, Req, State)
     end.
 
-maybe_perform_query({error, Reason}, _Req, State) ->
-    {error, {format, Reason}, State};
 maybe_perform_query({ok, Query}, Req=#rpbindexreq{stream=true}, State) ->
-    #rpbindexreq{bucket=Bucket, max_results=MaxResults, timeout=Timeout,
+    #rpbindexreq{type=T, bucket=B, max_results=MaxResults, timeout=Timeout,
                  pagination_sort=PgSort0, continuation=Continuation} = Req,
     #state{client=Client} = State,
+    Bucket = maybe_bucket_type(T, B),
     %% Special case: a continuation implies pagination even if no max_results
     PgSort = case Continuation of
                  undefined -> PgSort0;
@@ -119,10 +123,11 @@ maybe_perform_query({ok, Query}, Req=#rpbindexreq{stream=true}, State) ->
     ReturnTerms = riak_index:return_terms(Req#rpbindexreq.return_terms, Query),
     {reply, {stream, ReqId}, State#state{req_id=ReqId, req=Req#rpbindexreq{return_terms=ReturnTerms}}};
 maybe_perform_query({ok, Query}, Req, State) ->
-    #rpbindexreq{bucket=Bucket, max_results=MaxResults,
+    #rpbindexreq{type=T, bucket=B, max_results=MaxResults,
                  return_terms=ReturnTerms0, timeout=Timeout,
                  pagination_sort=PgSort0, continuation=Continuation} = Req,
     #state{client=Client} = State,
+    Bucket = maybe_bucket_type(T, B),
     PgSort = case Continuation of
                  undefined -> PgSort0;
                  _ -> true
@@ -208,3 +213,17 @@ process_stream({ReqId, Error}, ReqId, State=#state{req_id=ReqId}) ->
     {error, {format, Error}, State#state{req_id=undefined}};
 process_stream(_,_,State) ->
     {ignore, State}.
+
+%% Construct a {Type, Bucket} tuple, if not working with the default bucket
+maybe_bucket_type(undefined, B) ->
+    B;
+maybe_bucket_type(<<"default">>, B) ->
+    B;
+maybe_bucket_type(T, B) ->
+    {T, B}.
+
+%% always construct {Type, Bucket} tuple, filling in default type if needed
+bucket_type(undefined, B) ->
+    {<<"default">>, B};
+bucket_type(T, B) ->
+    {T, B}.

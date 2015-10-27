@@ -6,6 +6,12 @@ ERLANG_BIN       = $(shell dirname $(shell which erl))
 REBAR           ?= $(BASE_DIR)/rebar
 OVERLAY_VARS    ?=
 
+RIAK_CORE_STAT_PREFIX = riak
+export RIAK_CORE_STAT_PREFIX
+
+EXOMETER_PACKAGES = "(basic)"
+export EXOMETER_PACKAGES
+
 $(if $(ERLANG_BIN),,$(warning "Warning: No Erlang found in your path, this will probably not work"))
 
 .PHONY: rel stagedevrel deps
@@ -24,11 +30,26 @@ clean: testclean
 distclean: clean devclean relclean ballclean
 	./rebar delete-deps
 
-
 generate:
 	./rebar generate $(OVERLAY_VARS)
 
 
+##
+## Lock Targets
+##
+##  see https://github.com/seth/rebar_lock_deps_plugin
+lock: deps compile
+	./rebar lock-deps
+
+locked-all: locked-deps compile
+
+locked-deps:
+	@echo "Using rebar.config.lock file to fetch dependencies"
+	./rebar -C rebar.config.lock get-deps
+
+##
+## Test targets
+##
 TEST_LOG_FILE := eunit.log
 testclean:
 	@rm -f $(TEST_LOG_FILE)
@@ -48,7 +69,7 @@ test: deps compile testclean
 ##
 ## Release targets
 ##
-rel: deps compile generate
+rel: locked-deps compile generate
 
 relclean:
 	rm -rf rel/riak
@@ -65,7 +86,7 @@ relclean:
 ##    make stagedevrel DEVNODES=68
 
 .PHONY : stagedevrel devrel
-DEVNODES ?= 5
+DEVNODES ?= 8
 
 # 'seq' is not available on all *BSD, so using an alternate in awk
 SEQ = $(shell awk 'BEGIN { for (i = 1; i < '$(DEVNODES)'; i++) printf("%i ", i); print i ;exit(0);}')
@@ -77,6 +98,21 @@ dev% : all
 	mkdir -p dev
 	rel/gen_dev $@ rel/vars/dev_vars.config.src rel/vars/$@_vars.config
 	(cd rel && ../rebar generate target_dir=../dev/$@ overlay_vars=vars/$@_vars.config)
+
+perfdev : all
+	perfdev/bin/riak stop || :
+	rm -rf perfdev
+	mkdir -p perfdev
+	rel/gen_dev $@ rel/vars/perf_vars.config.src rel/vars/perf_vars.config
+	(cd rel && ../rebar generate target_dir=../perfdev overlay_vars=vars/perf_vars.config)
+	$(foreach dep,$(wildcard deps/*), rm -rf perfdev/lib/$(shell basename $(dep))* && ln -sf $(abspath $(dep)) perfdev/lib;)
+
+perf:
+	perfdev/bin/riak stop || :
+	perfdev/bin/riak start
+	perfdev/bin/riak-admin wait-for-service riak_kv 'perfdev@127.0.0.1'
+	escript apps/riak/src/riak_perf_smoke || :
+	perfdev/bin/riak stop
 
 stagedev% : dev%
 	  $(foreach dep,$(wildcard deps/*), rm -rf dev/$^/lib/$(shell basename $(dep))* && ln -sf $(abspath $(dep)) dev/$^/lib;)
@@ -98,10 +134,10 @@ docs:
 orgs: orgs-doc orgs-README
 
 orgs-doc:
-	@emacs -l orgbatch.el -batch --eval="(riak-export-doc-dir \"doc\" 'html)"
+	@emacs -l misc/orgbatch.el -batch --eval="(riak-export-doc-dir \"doc\" 'html)"
 
 orgs-README:
-	@emacs -l orgbatch.el -batch --eval="(riak-export-doc-file \"README.org\" 'ascii)"
+	@emacs -l misc/orgbatch.el -batch --eval="(riak-export-doc-file \"README.org\" 'ascii)"
 	@mv README.txt README
 
 APPS = kernel stdlib sasl erts ssl tools os_mon runtime_tools crypto inets \
@@ -132,6 +168,16 @@ cleanplt:
 	@echo
 	sleep 5
 	rm $(COMBO_PLT)
+
+
+## Create a dependency graph png
+depgraph: graphviz
+	@echo "Note: If you have nothing in deps/ this might be boring"
+	@echo "Creating dependency graph..."
+	@misc/mapdeps.erl | dot -Tpng -oriak.png
+	@echo "Dependency graph created as riak.png"
+graphviz:
+	$(if $(shell which dot),,$(error "To make the depgraph, you need graphviz installed"))
 
 ##
 ## Version and naming variables for distribution and packaging
@@ -184,7 +230,7 @@ get_dist_deps = mkdir distdir && \
                 git clone . distdir/$(CLONEDIR) && \
                 cd distdir/$(CLONEDIR) && \
                 git checkout $(REPO_TAG) && \
-                $(MAKE) deps && \
+                $(MAKE) locked-deps && \
                 echo "- Dependencies and their tags at build time of $(REPO) at $(REPO_TAG)" > $(MANIFEST_FILE) && \
                 for dep in deps/*; do \
                     cd $${dep} && \
@@ -255,3 +301,7 @@ package: distdir/$(PKG_ID).tar.gz
 
 .PHONY: package
 export PKG_VERSION PKG_ID PKG_BUILD BASE_DIR ERLANG_BIN REBAR OVERLAY_VARS RELEASE
+
+# Package up a devrel to save time later rebuilding it
+pkg-devrel: devrel
+	tar -czf $(PKG_ID)-devrel.tar.gz dev/

@@ -4,46 +4,63 @@ minispade.register('shared', function () {
    * ClusterAndNodeControls contains properties shared by:
    * - RiakControl.ClusterController
    * - RiakControl.NodesController
+   * - RiakControl.RingController
    */
   RiakControl.ClusterAndNodeControls = Ember.Mixin.create({
 
-    /**
-     * Stage a change.
-     *
-     * @returns {void}
-     */
-    stageChange: function(node, action, replacement, success, failure) {
-      var self = this;
+    actions: {
+      /**
+       * Stage a change.
+       *
+       * @returns {void}
+       */
+      stageChange: function(node, action, replacement, success, failure) {
+        var self = this,
+            ajax = $.ajax({
+              type:     'PUT',
+              url:      '/admin/cluster',
+              dataType: 'json',
+              data:     { changes:
+                          [{
+                            node:        node,
+                            action:      action,
+                            replacement: replacement
+                          }]
+                        }
+            });
 
-      $.ajax({
-        type:     'PUT',
-        url:      '/admin/cluster',
-        dataType: 'json',
+        ajax.then(
 
-        data:     { changes:
-                    [{
-                      node:        node,
-                      action:      action,
-                      replacement: replacement
-                    }]
-                  },
+          // success...
+          function(d) {
+            if(success) {
+              success();
+            }
 
-        success: function(d) {
-          if(success) {
-            success();
+            self.reload();
+          },
+
+          // error...
+          function (jqXHR, textStatus, errorThrown) {
+            if(failure) {
+              failure();
+            }
+
+            self.get('displayError').call(self, jqXHR, textStatus, errorThrown);
           }
+        );
 
-          self.reload();
-        },
+      },
 
-        error: function (jqXHR, textStatus, errorThrown) {
-          if(failure) {
-            failure();
-          }
-
-          self.get('displayError').call(self, jqXHR, textStatus, errorThrown);
-        }
-      });
+      /**
+       * The action specified on the <a> tag creating the 'x' button in the error message div.
+       * By setting the 'errorMessage' property back to an empty string, the message will disappear.
+       *
+       * @returns {void}
+       */
+      hideError: function () {
+        this.set('errorMessage', '');
+      }
     },
 
     /**
@@ -86,16 +103,6 @@ minispade.register('shared', function () {
     },
 
     /**
-     * The action specified on the <a> tag creating the 'x' button in the error message div.
-     * By setting the 'errorMessage' property back to an empty string, the message will disappear.
-     *
-     * @returns {void}
-     */
-    hideError: function () {
-      this.set('errorMessage', '');
-    },
-
-    /**
      * Called by the router, to start polling when this controller/view is navigated to.
      *
      * @returns {void}
@@ -123,6 +130,16 @@ minispade.register('shared', function () {
    * - RiakControl.CurrentNodesItemView
    */
   RiakControl.NodeProperties = Ember.Mixin.create({
+
+    /**
+     * In the current cluster area, the host node has extra content in its
+     * actions box so it needs to be a little taller than the others.
+     *
+     * @returns {String}
+     */
+    hostNodeClasses: function () {
+      return this.get('me') ? 'node taller' : 'node';
+    }.property('me'),
 
     /**
      * Color the lights appropriately based on the node status.

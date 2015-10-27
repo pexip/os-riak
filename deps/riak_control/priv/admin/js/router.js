@@ -8,176 +8,156 @@ minispade.register('router', function() {
    * ember-only components, or using the legacy pub/sub implementation
    * to render older pages which are scheduled for deprecation.
    */
-  RiakControl.Router = Ember.Router.extend(
-    /** @scope RiakControl.Router.prototype */ {
-    root: Ember.Route.extend({
-      showSnapshot: Ember.Route.transitionTo('snapshot.index'),
+  RiakControl.Router.map(function() {
+    /** @scope Ember.RouterDSL callback */
 
-      showCluster: Ember.Route.transitionTo('cluster.index'),
-
-      showNodes: Ember.Route.transitionTo('nodes.index'),
-
-      showRing: Ember.Route.transitionTo('ring.index'),
-
-      index: Ember.Route.extend({
-        route: '/',
-        redirectsTo: 'snapshot.index'
-      }),
-
-      snapshot: Ember.Route.extend({
-        route: 'snapshot',
-
-        connectOutlets: function(router) {
-          router.get('applicationController').connectOutlet('snapshot', RiakControl.Node.find());
-          $.riakControl.markNavActive('nav-snapshot');
-        },
-
-        enter: function(router) {
-          router.get('snapshotController').startInterval();
-        },
-
-        exit: function(router) {
-          router.get('snapshotController').cancelInterval();
-        },
-
-        index: Ember.Route.extend({
-          route: '/'
-        })
-      }),
-
-      cluster: Ember.Route.extend({
-        route: 'cluster',
-
-        connectOutlets: function(router) {
-          router.get('applicationController').connectOutlet('cluster',
-            RiakControl.CurrentAndPlannedCluster.create({
-              stagedCluster: [], currentCluster: []
-            }));
-          $.riakControl.markNavActive('nav-cluster');
-        },
-
-        enter: function(router) {
-          router.get('clusterController').startInterval();
-        },
-
-        exit: function(router) {
-          router.get('clusterController').cancelInterval();
-        },
-
-        index: Ember.Route.extend({
-          route: '/'
-        })
-      }),
-
-      nodes: Ember.Route.extend({
-        route: 'nodes',
-
-        connectOutlets: function(router) {
-          router.get('applicationController').connectOutlet('nodes', RiakControl.Node.find());
-          $.riakControl.markNavActive('nav-nodes');
-        },
-
-        enter: function(router) {
-          router.get('nodesController').startInterval();
-        },
-
-        exit: function(router) {
-          router.get('nodesController').cancelInterval();
-        },
-
-        index: Ember.Route.extend({
-          route: '/'
-        })
-      }),
-
-      ring: Ember.Route.extend({
-        route: 'ring',
-
-        filterRing: Ember.Route.transitionTo('ring.filtered.index'),
-
-        paginateRing: Ember.Route.transitionTo('paginated'),
-
-        connectOutlets: function(router) {
-          router.get('applicationController').connectOutlet('ring', RiakControl.Partition.find());
-          router.get('ringController').connectOutlet('partitionFilter', 'partitionFilter', RiakControl.Node.find());
-          $.riakControl.markNavActive('nav-ring');
-        },
-
-        enter: function(router) {
-          router.get('ringController').startInterval();
-          router.get('partitionFilterController').startInterval();
-        },
-
-        exit: function(router) {
-          router.get('ringController').cancelInterval();
-          router.get('partitionFilterController').cancelInterval();
-        },
-
-        index: Ember.Route.extend({
-          route: '/'
-        }),
-
-        paginated: Ember.Route.extend({
-          route: '/page/:page_id',
-
-          connectOutlets: function(router, context) {
-            router.get('ringController').set('selectedPage', context.page_id);
-          },
-
-          exit: function(router) {
-            router.get('ringController').set('selectedPage', undefined);
-          }
-        }),
-
-        filtered: Ember.Route.extend({
-          route: '/filter/:filterType/:filterValue',
-
-          serialize: function(router, context) {
-            if(context) {
-              return {
-                filterType: context.type,
-                filterValue: context.value
-              };
-            } else {
-              return {};
-            }
-          },
-
-          deserialize: function(router, params) {
-            return RiakControl.PartitionFilter.create({
-              type: params.filterType,
-              value: params.filterValue
-            });
-          },
-
-          connectOutlets: function(router, context) {
-            router.get('ringController').set('selectedPartitionFilter', context);
-            router.get('partitionFilterController').set('selectedPartitionFilterValue', context.value);
-          },
-
-          exit: function(router) {
-            router.get('ringController').set('selectedPartitionFilter', undefined);
-            router.get('partitionFilterController').set('selectedPartitionFilterValue', undefined);
-          },
-
-          index: Ember.Route.extend({
-            route: '/'
-          }),
-
-          paginated: Ember.Route.extend({
-            route: '/page/:page_id',
-
-            connectOutlets: function(router, context) {
-              router.get('ringController').set('selectedPage', context.page_id);
-            },
-
-            exit: function(router) {
-              router.get('ringController').set('selectedPage', undefined);
-            }
-          })
-        })
-      })
-    })
+    this.route('snapshot');
+    this.route('cluster');
+    this.route('nodes');
+    this.route('ring');
   });
 
+  RiakControl.IndexRoute = Ember.Route.extend(
+    /** @scope Ember.Route.prototype */ {
+
+    redirect: function() {
+      this.transitionTo('snapshot');
+    }
+  });
+
+  RiakControl.SnapshotRoute = Ember.Route.extend(
+    /** @scope Ember.Route.prototype */ {
+
+    model: function() {
+      return this.store.find('node');
+    },
+
+    renderTemplate: function() {
+      this.render('snapshot');
+      $.riakControl.markNavActive('nav-snapshot');
+    },
+
+    activate: function() {
+      this.controllerFor('snapshot').startInterval();
+    },
+
+    deactivate: function() {
+      this.controllerFor('snapshot').cancelInterval();
+    }
+  });
+
+  RiakControl.ClusterRoute = Ember.Route.extend(
+    /** @scope Ember.Route.prototype */ {
+
+    model: function() {
+      var cluster = this.controllerFor('cluster');
+
+      /*
+       * Don't return a promise if we have previously
+       * failed to load data.
+       */
+      if (cluster.get('cannotLoad') === true) {
+        return cluster.get('content');
+
+      } else {
+        return cluster.load().then(function (d) {
+          return d;
+        });
+      }
+    },
+
+    /*
+     * In the event of an error, the cannotLoad property
+     * will be set to true. This way we can still
+     * transition into the state without getting caught
+     * in an infinit .load() loop.
+     */
+    events: {
+      error: function () {
+        this.transitionTo('cluster');
+      }
+    },
+
+    renderTemplate: function() {
+      this.render('cluster');
+      $.riakControl.markNavActive('nav-cluster');
+    },
+
+    activate: function() {
+      this.controllerFor('cluster').startInterval();
+    },
+
+    deactivate: function() {
+      this.controllerFor('cluster').cancelInterval();
+    }
+  });
+
+  RiakControl.NodesRoute = Ember.Route.extend(
+    /** @scope Ember.Route.prototype */ {
+
+    model: function() {
+      return this.store.find('node');
+    },
+
+    renderTemplate: function() {
+      this.render('nodes');
+      $.riakControl.markNavActive('nav-nodes');
+    },
+
+    activate: function() {
+      this.controllerFor('nodes').startInterval();
+    },
+
+    deactivate: function() {
+      this.controllerFor('nodes').cancelInterval();
+    }
+  });
+
+  RiakControl.RingRoute = Ember.Route.extend(
+    /** @scope Ember.Route.prototype */ {
+
+    model: function() {
+      var ring = this.controllerFor('ring');
+
+      /*
+       * Don't return a promise if we have previously
+       * failed to load data.
+       */
+      if (ring.get('cannotLoad') === true) {
+        return ring.get('content');
+
+      } else {
+        return ring.load().then(function (d) {
+          return d;
+        });
+      }
+    },
+
+    /*
+     * In the event of an error, the cannotLoad property
+     * will be set to true. This way we can still
+     * transition into the state without getting caught
+     * in an infinit .load() loop.
+     */
+    events: {
+      error: function () {
+        this.transitionTo('ring');
+      }
+    },
+
+    renderTemplate: function() {
+      this.render('ring');
+      $.riakControl.markNavActive('nav-ring');
+    },
+
+    activate: function() {
+      this.controllerFor('ring').startInterval();
+    },
+
+    deactivate: function() {
+      this.controllerFor('ring').cancelInterval();
+    }
+  });
+
+  RiakControl.LoadingRoute = Ember.Route.extend({});
 });

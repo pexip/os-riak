@@ -12,13 +12,6 @@
 %% internal
 -export([active/1,idle/0,wait_for_local/1]).
 
--import(lists,[reverse/1,foreach/2,map/2]).
--import(dict,[fetch/2
-              , store/3
-              , from_list/1]).
-
-%-define(bla,erlang:display(process_info(self(),current_function))).
-
 %% states
 -define(ACTIVE         , ?MODULE:active).
 -define(IDLE           , ?MODULE:idle).
@@ -63,10 +56,11 @@ init() ->
 
 idle() ->
   receive
-    {start,{HostPid,Conf}} -> ?ACTIVE(start_trace(HostPid,Conf));
+    {start,{HostPid,Conf}} -> link(HostPid),
+                              ?ACTIVE(start_trace(HostPid,Conf));
     {stop,{HostPid,_}}     -> HostPid ! {prfTrc,{not_started,idle,self()}},
                               ?IDLE();
-    {'EXIT',_,exiting}     -> ?IDLE();
+    {'EXIT',_,normal}      -> ?IDLE();
     X                      -> ?log({weird_in,X}), ?IDLE()
   end.
 
@@ -74,8 +68,8 @@ active({not_started,R,HostPid}) ->
   HostPid ! {prfTrc,{not_started,R,self()}},
   ?IDLE();
 active(LD) ->
-  Cons = fetch(consumer,LD),
-  HostPid = fetch(host_pid,LD),
+  Cons = dict:fetch(consumer,LD),
+  HostPid = dict:fetch(host_pid,LD),
   receive
     {start,{Pid,_}}     -> Pid ! {prfTrc,{already_started,self()}},?ACTIVE(LD);
     {stop,_}            -> remote_stop(Cons,LD),?WAIT_FOR_LOCAL(Cons);
@@ -101,21 +95,19 @@ remote_stop(Consumer, LD) ->
   consumer_stop(Consumer).
 
 stop_trace(LD) ->
-  erlang:trace(all,false,fetch(flags,fetch(conf,LD))),
+  erlang:trace(all,false,dict:fetch(flags,dict:fetch(conf,LD))),
   unset_tps().
 
 start_trace(HostPid,Conf) ->
-  case {maybe_load_rtps(fetch(rtps,Conf)),
-        is_message_trace(fetch(flags,Conf))} of
-    {[],false}-> {not_started,no_modules,HostPid};
-    {Rtps,_}  -> start_trace(from_list([{host_pid,HostPid},
-                                        {conf,store(rtps,Rtps,Conf)}]))
-  end.
+  Rtps = maybe_load_rtps(dict:fetch(rtps,Conf)),
+  start_trace(
+    dict:from_list([{host_pid,HostPid},
+                    {conf,dict:store(rtps,Rtps,Conf)}])).
 
 maybe_load_rtps(Rtps) ->
   lists:foldl(fun maybe_load_rtp/2, [], Rtps).
 
-maybe_load_rtp({{M,F,A},_MatchSpec,_Flags} = Rtp,O) ->
+maybe_load_rtp({{M,_,_},_MatchSpec,_Flags} = Rtp,O) ->
   try
     case code:which(M) of
       preloaded         -> ok;
@@ -124,25 +116,22 @@ maybe_load_rtp({{M,F,A},_MatchSpec,_Flags} = Rtp,O) ->
     end,
     [Rtp|O]
   catch
-    _:R -> ?log({no_such_function,{R,{M,F,A}}}), O
+    _:_ -> O
   end.
 
-is_message_trace(Flags) ->
-  (lists:member(send,Flags) orelse lists:member('receive',Flags)).
-
 start_trace(LD) ->
-  Conf = fetch(conf,LD),
-  HostPid = fetch(host_pid,LD),
-  link(HostPid),
-  Consumer = consumer(fetch(where,Conf),fetch(time,Conf)),
-  HostPid ! {prfTrc,{starting,self(),Consumer}},
-  Procs = mk_prc(fetch(procs,Conf)),
-  Flags = [{tracer,real_consumer(Consumer)}|fetch(flags,Conf)],
+  Conf = dict:fetch(conf,LD),
+  Consumer = consumer(dict:fetch(where,Conf),dict:fetch(time,Conf)),
+  Ps = lists:foldl(fun mk_prc/2,[],dict:fetch(procs,Conf)),
+  Rtps = dict:fetch(rtps,Conf),
+  Flags = [{tracer,real_consumer(Consumer)}|dict:fetch(flags,Conf)],
   unset_tps(),
-  erlang:trace(Procs,true,Flags),
+  NoProcs = lists:sum([erlang:trace(P,true,Flags) || P <- Ps]),
   untrace(family(redbug)++family(prfTrc),Flags),
-  set_tps(fetch(rtps,Conf)),
-  store(consumer,Consumer,LD).
+  NoFuncs = set_tps(Rtps),
+  assert_trace_targets(NoProcs,NoFuncs,Flags),
+  dict:fetch(host_pid,LD) ! {prfTrc,{starting,NoProcs,NoFuncs,self(),Consumer}},
+  dict:store(consumer,Consumer,LD).
 
 family(Daddy) ->
   try D = whereis(Daddy),
@@ -158,23 +147,42 @@ untrace(Pids,Flags) ->
           node(P)==node(),
           {flags,[]}=/=erlang:trace_info(P,flags)].
 
+assert_trace_targets(NoProcs,NoFuncs,Flags) ->
+  case 0 < NoProcs of
+    true -> ok;
+    false-> exit({prfTrc,no_matching_processes})
+  end,
+  case 0 < NoFuncs orelse is_message_trace(Flags) of
+    true -> ok;
+    false-> exit({prfTrc,no_matching_functions})
+  end.
+
+is_message_trace(Flags) ->
+  (lists:member(send,Flags) orelse lists:member('receive',Flags)).
+
 unset_tps() ->
   erlang:trace_pattern({'_','_','_'},false,[local]),
   erlang:trace_pattern({'_','_','_'},false,[global]).
 
 set_tps(TPs) ->
-  foreach(fun set_tps_f/1,TPs).
+  lists:foldl(fun set_tps_f/2,0,TPs).
 
-set_tps_f({MFA,MatchSpec,Flags}) ->
-  erlang:trace_pattern(MFA,MatchSpec,Flags).
+set_tps_f({MFA,MatchSpec,Flags},A) ->
+  A+erlang:trace_pattern(MFA,MatchSpec,Flags).
 
-mk_prc(all) -> all;
-mk_prc(Pid) when is_pid(Pid) -> Pid;
-mk_prc({pid,P1,P2}) when is_integer(P1), is_integer(P2) -> c:pid(0,P1,P2);
-mk_prc(Reg) when is_atom(Reg) ->
+mk_prc(all,A) ->
+  [all|A];
+mk_prc(Reg,A) when is_atom(Reg) ->
   case whereis(Reg) of
-    undefined -> exit({no_such_process, Reg});
-    Pid when is_pid(Pid) -> Pid
+    Pid when is_pid(Pid) -> mk_prc(Pid,A);
+    undefined -> A
+  end;
+mk_prc({pid,P1,P2},A) when is_integer(P1), is_integer(P2) ->
+  mk_prc(c:pid(0,P1,P2),A);
+mk_prc(Pid,A) when is_pid(Pid) ->
+  case is_process_alive(Pid) of
+    true -> [Pid|A];
+    false-> A
   end.
 
 real_consumer(C) ->
@@ -196,32 +204,35 @@ consumer_stop(Pid) -> Pid ! stop.
 
 consumer_pid({Pid,Cnt,MaxQueue,MaxSize},Buf,Time) ->
   Conf =
-    from_list([{daddy,self()},
-               {count,Cnt},
-               {time,Time},
-               {maxsize,MaxSize},
-               {maxqueue,MaxQueue},
-               {where,Pid},
-               {buffering,Buf}]),
+    dict:from_list(
+      [{daddy,self()},
+       {count,Cnt},
+       {time,Time},
+       {maxsize,MaxSize},
+       {maxqueue,MaxQueue},
+       {where,Pid},
+       {buffering,Buf}]),
   spawn_link(fun() -> init_local_pid(Conf) end).
 
 consumer_file(File,Size,WrapCount,Time) ->
   Conf =
-    from_list([{style,file}
-               , {file,File}
-               , {size,Size}
-               , {wrap_count,WrapCount}
-               , {time,Time}
-               , {daddy, self()}]),
+    dict:from_list(
+      [{style,file}
+       , {file,File}
+       , {size,Size}
+       , {wrap_count,WrapCount}
+       , {time,Time}
+       , {daddy, self()}]),
   spawn_link(fun() -> init_local_port(Conf) end).
 
 consumer_ip(Port,QueueSize,Time) ->
   Conf =
-    from_list([{style,ip}
-               , {port_no,Port}
-               , {queue_size,QueueSize}
-               , {time,Time}
-               , {daddy, self()}]),
+    dict:from_list(
+      [{style,ip}
+       , {port_no,Port}
+       , {queue_size,QueueSize}
+       , {time,Time}
+       , {daddy, self()}]),
   spawn_link(fun() -> init_local_port(Conf) end).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -232,14 +243,14 @@ consumer_ip(Port,QueueSize,Time) ->
 %%%    timeout
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init_local_port(Conf) ->
-  erlang:start_timer(fetch(time,Conf),self(),fetch(daddy,Conf)),
+  erlang:start_timer(dict:fetch(time,Conf),self(),dict:fetch(daddy,Conf)),
   Port = mk_port(Conf),
-  loop_local_port(store(port,Port,Conf)).
+  loop_local_port(dict:store(port,Port,Conf)).
 
 loop_local_port(Conf) ->
-  Daddy = fetch(daddy, Conf),
+  Daddy = dict:fetch(daddy, Conf),
   receive
-    {show_port,Pid}   -> Pid ! fetch(port,Conf),
+    {show_port,Pid}   -> Pid ! dict:fetch(port,Conf),
                          loop_local_port(Conf);
     stop              -> dbg:flush_trace_port(),
                          exit(local_done);
@@ -249,15 +260,15 @@ loop_local_port(Conf) ->
   end.
 
 mk_port(Conf) ->
-  case fetch(style,Conf) of
+  case dict:fetch(style,Conf) of
     ip ->
-      Port = fetch(port_no,Conf),
-      QueueSize = fetch(queue_size,Conf),
+      Port = dict:fetch(port_no,Conf),
+      QueueSize = dict:fetch(queue_size,Conf),
       (dbg:trace_port(ip,{Port, QueueSize}))();
     file ->
-      File = fetch(file,Conf),
-      WrapCount = fetch(wrap_count,Conf),
-      WrapSize = fetch(size,Conf)*1024*1024,% file size (per file) in MB.
+      File = dict:fetch(file,Conf),
+      WrapCount = dict:fetch(wrap_count,Conf),
+      WrapSize = dict:fetch(size,Conf)*1024*1024,% file size (per file) in MB.
       Suffix = ".trc",
       (dbg:trace_port(file,{File, wrap, Suffix, WrapSize, WrapCount}))()
   end.
@@ -275,13 +286,13 @@ mk_port(Conf) ->
 -record(ld,{daddy,where,count,maxqueue,maxsize}).
 
 init_local_pid(Conf) ->
-  erlang:start_timer(fetch(time,Conf),self(),fetch(daddy,Conf)),
-  loop_lp({#ld{daddy=fetch(daddy,Conf),
-               where=fetch(where,Conf),
-               maxsize=fetch(maxsize,Conf),
-               maxqueue=fetch(maxqueue,Conf)},
-           buffering(fetch(buffering,Conf)),
-           fetch(count,Conf)}).
+  erlang:start_timer(dict:fetch(time,Conf),self(),dict:fetch(daddy,Conf)),
+  loop_lp({#ld{daddy=dict:fetch(daddy,Conf),
+               where=dict:fetch(where,Conf),
+               maxsize=dict:fetch(maxsize,Conf),
+               maxqueue=dict:fetch(maxqueue,Conf)},
+           buffering(dict:fetch(buffering,Conf)),
+           dict:fetch(count,Conf)}).
 
 buffering(yes) -> [];
 buffering(no) -> no.
@@ -352,7 +363,8 @@ maybe_exit_args(_,_) ->
 send_one(LD,Msg) -> LD#ld.where ! [msg(Msg)].
 
 flush(_,no) -> ok;
-flush(LD,Buffer) -> LD#ld.where ! map(fun msg/1, reverse(Buffer)).
+flush(LD,Buffer) ->
+  LD#ld.where ! lists:map(fun msg/1,lists:reverse(Buffer)).
 
 msg({'send',Pid,TS,{Msg,To}})          -> {'send',{Msg,pi(To)},pi(Pid),ts(TS)};
 msg({'receive',Pid,TS,Msg})            -> {'recv',Msg,         pi(Pid),ts(TS)};
@@ -363,23 +375,24 @@ msg({'call',Pid,TS,MFA})               -> {'call',{MFA,<<>>},  pi(Pid),ts(TS)}.
 
 pi(P) when is_pid(P) ->
   try process_info(P, registered_name) of
-      [] -> case process_info(P, initial_call) of
-              {_, {proc_lib,init_p,5}} -> proc_lib:translate_initial_call(P);
-              {_,MFA} -> MFA;
-              undefined -> P
-            end;
-      {_,Nam} -> Nam;
-      undefined -> P
+      [] ->
+        case process_info(P, initial_call) of
+          {_, {proc_lib,init_p,5}} -> {P,proc_lib:translate_initial_call(P)};
+          {_,MFA}                  -> {P,MFA};
+          undefined                -> {P,dead}
+        end;
+      {_,Nam}   -> {P,Nam};
+      undefined -> {P,dead}
   catch
-    error:badarg -> node(P)
+    error:badarg -> {P,node(P)}
   end;
 pi(P) when is_port(P) ->
   {name,N} = erlang:port_info(P,name),
   [Hd|_] = string:tokens(N," "),
-  reverse(hd(string:tokens(reverse(Hd),"/")));
+  {P,lists:reverse(hd(string:tokens(lists:reverse(Hd),"/")))};
 pi(R) when is_atom(R) -> R;
 pi({R,Node}) when is_atom(R), Node == node() -> R;
-pi({R, Node}) when is_atom(R), is_atom(Node) -> {R, Node}.
+pi({R,Node}) when is_atom(R), is_atom(Node) -> {R,Node}.
 
 ts(Nw) ->
   {_,{H,M,S}} = calendar:now_to_local_time(Nw),

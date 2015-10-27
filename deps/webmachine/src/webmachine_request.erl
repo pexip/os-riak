@@ -1,6 +1,6 @@
 %% @author Justin Sheehy <justin@basho.com>
 %% @author Andy Gross <andy@basho.com>
-%% @copyright 2007-2012 Basho Technologies
+%% @copyright 2007-2014 Basho Technologies
 %% Based on mochiweb_request.erl, which is Copyright 2007 Mochi Media, Inc.
 %%
 %%    Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,8 +100,8 @@
 -include("wm_reqstate.hrl").
 -include("wm_reqdata.hrl").
 
--define(WMVSN, "1.10.0").
--define(QUIP, "never breaks eye contact").
+-define(WMVSN, "1.10.8").
+-define(QUIP, "that head fake, tho").
 -define(IDLE_TIMEOUT, infinity).
 
 new(#wm_reqstate{}=ReqState) ->
@@ -271,7 +271,7 @@ call({send_response, {Code, ReasonPhrase}=CodeAndReason}, Req) when is_integer(C
                 send_response(CodeAndReason, Req)
         end,
     LogData = NewState#wm_reqstate.log_data,
-    NewLogData = LogData#wm_log_data{finish_time=now()},
+    NewLogData = LogData#wm_log_data{finish_time=os:timestamp()},
     {Reply, NewState#wm_reqstate{log_data=NewLogData}};
 call(resp_body, {?MODULE, ReqState}) ->
     {wrq:resp_body(ReqState#wm_reqstate.reqdata), ReqState};
@@ -318,9 +318,7 @@ get_header_value(K, ReqState) ->
 
 get_outheader_value(K, {?MODULE, ReqState}) ->
     {mochiweb_headers:get_value(K,
-                                wrq:resp_headers(ReqState#wm_reqstate.reqdata)), ReqState};
-get_outheader_value(K, ReqState) ->
-    get_outheader_value(K, {?MODULE, ReqState}).
+                                wrq:resp_headers(ReqState#wm_reqstate.reqdata)), ReqState}.
 
 send(Socket, Data) ->
     case mochiweb_socket:send(Socket, iolist_to_binary(Data)) of

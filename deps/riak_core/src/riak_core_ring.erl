@@ -128,13 +128,16 @@
          set_resized_ring/2,
          future_index/3,
          future_index/4,
+         future_index/5,
          is_future_index/4,
          future_owner/2,
          future_num_partitions/1,
          vnode_type/2,
          deletion_complete/3]).
 
--export_type([riak_core_ring/0]).
+-export_type([riak_core_ring/0, ring_size/0, partition_id/0]).
+
+-include("riak_core.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -143,10 +146,11 @@
 -define(CHSTATE, #chstate_v2).
 -record(chstate_v2, {
     nodename :: term(),          % the Node responsible for this chstate
-    vclock   :: vclock:vclock(), % for this chstate object, entries are
+    vclock   :: vclock:vclock() | undefined, % for this chstate object, entries are
                                  % {Node, Ctr}
     chring   :: chash:chash(),   % chash ring of {IndexAsInt, Node} mappings
-    meta     :: dict(),          % dict of cluster-wide other data (primarily
+    meta     :: riak_core_dict() | undefined,
+                                 % dict of cluster-wide other data (primarily
                                  % bucket N-value, etc)
 
     clustername :: {term(), term()},
@@ -155,7 +159,7 @@
     claimant :: term(),
     seen     :: [{term(), vclock:vclock()}],
     rvsn     :: vclock:vclock()
-}). 
+}).
 
 %% Legacy chstate
 -record(chstate, {
@@ -163,19 +167,19 @@
     vclock,   % for this chstate object, entries are {Node, Ctr}
     chring :: chash:chash(),   % chash ring of {IndexAsInt, Node} mappings
     meta      % dict of cluster-wide other data (primarily bucket N-value, etc)
-}). 
+}).
 
 -type member_status() :: joining | valid | invalid | leaving | exiting | down.
 
 %% type meta_entry(). Record for each entry in #chstate.meta
 -record(meta_entry, {
     value,    % The value stored under this entry
-    lastmod   % The last modified time of this entry, 
+    lastmod   % The last modified time of this entry,
               %  from calendar:datetime_to_gregorian_seconds(
-              %                             calendar:universal_time()), 
+              %                             calendar:universal_time()),
 }).
 
-%% riak_core_ring() is the opaque data type used for partition ownership
+%% @type riak_core_ring() is the opaque data type used for partition ownership
 -type riak_core_ring() :: ?CHSTATE{}.
 -type chstate() :: riak_core_ring().
 
@@ -183,6 +187,13 @@
                            NextOwner :: node(),
                            awaiting | complete}
                         | {undefined, undefined, undefined}.
+
+-type resize_transfer() :: {{integer(),term()}, ordsets:ordset(node()), awaiting | complete}.
+
+-type ring_size() :: non_neg_integer().
+%% @type partition_id() (or partition number) -
+%% This integer represents a value in the range [0, ring_size-1].
+-type partition_id() :: non_neg_integer().
 
 %% ===================================================================
 %% Public API
@@ -270,7 +281,7 @@ nearly_equal(RingA, RingB) ->
 
 %% @doc Determine if a given Index/Node `IdxNode' combination is a
 %%      primary.
--spec is_primary(chstate(), {integer(), node()}) -> boolean().
+-spec is_primary(chstate(), {chash:index_as_int(), node()}) -> boolean().
 is_primary(Ring, IdxNode) ->
     Owners = all_owners(Ring),
     lists:member(IdxNode, Owners).
@@ -342,7 +353,7 @@ fresh(NodeName) ->
 
 %% @doc Equivalent to fresh/1 but allows specification of the ring size.
 %%      Called by fresh/1, and otherwise only intended for testing purposes.
--spec fresh(RingSize :: integer(), NodeName :: term()) -> chstate().
+-spec fresh(ring_size(), NodeName :: term()) -> chstate().
 fresh(RingSize, NodeName) ->
     VClock=vclock:increment(NodeName, vclock:fresh()),
     GossipVsn = riak_core_gossip:gossip_version(),
@@ -360,7 +371,7 @@ fresh(RingSize, NodeName) ->
 %% @doc change the size of the ring to `NewRingSize'. If the ring
 %%      is larger than the current ring any new indexes will be owned
 %%      by a dummy host
--spec resize(chstate(), integer()) -> chstate().
+-spec resize(chstate(), ring_size()) -> chstate().
 resize(State, NewRingSize) ->
     NewRing = lists:foldl(fun({Idx,Owner}, RingAcc) ->
                                   chash:update(Idx, Owner, RingAcc)
@@ -370,9 +381,9 @@ resize(State, NewRingSize) ->
     set_chash(State, NewRing).
 
 % @doc Return a value from the cluster metadata dict
--spec get_meta(Key :: term(), State :: chstate()) -> 
+-spec get_meta(Key :: term(), State :: chstate()) ->
     {ok, term()} | undefined.
-get_meta(Key, State) -> 
+get_meta(Key, State) ->
     case dict:find(Key, State?CHSTATE.meta) of
         error -> undefined;
         {ok, '$removed'} -> undefined;
@@ -399,7 +410,7 @@ get_buckets(State) ->
         end, [], Keys).
 
 %% @doc Return the node that owns the given index.
--spec index_owner(State :: chstate(), Idx :: integer()) -> Node :: term().
+-spec index_owner(State :: chstate(), Idx :: chash:index_as_int()) -> Node :: term().
 index_owner(State, Idx) ->
     {Idx, Owner} = lists:keyfind(Idx, 1, all_owners(State)),
     Owner.
@@ -407,21 +418,21 @@ index_owner(State, Idx) ->
 %% @doc Return the node that will own this index after transtions have completed
 %%      this function will error if the ring is shrinking and Idx no longer exists
 %%      in it
--spec future_owner(chstate(), integer()) -> term().
+-spec future_owner(chstate(), chash:index_as_int()) -> term().
 future_owner(State, Idx) ->
     index_owner(future_ring(State), Idx).
 
 %% @doc Return all partition indices owned by the node executing this function.
--spec my_indices(State :: chstate()) -> [integer()].
+-spec my_indices(State :: chstate()) -> [chash:index_as_int()].
 my_indices(State) ->
     [I || {I,Owner} <- ?MODULE:all_owners(State), Owner =:= node()].
 
 %% @doc Return the number of partitions in this Riak ring.
--spec num_partitions(State :: chstate()) -> integer().
+-spec num_partitions(State :: chstate()) -> pos_integer().
 num_partitions(State) ->
     chash:size(State?CHSTATE.chring).
 
--spec future_num_partitions(chstate()) -> integer().
+-spec future_num_partitions(chstate()) -> pos_integer().
 future_num_partitions(State=?CHSTATE{chring=CHRing}) ->
     case resized_ring(State) of
         {ok, C} -> chash:size(C);
@@ -436,7 +447,7 @@ owner_node(State) ->
 %% @doc For a given object key, produce the ordered list of
 %%      {partition,node} pairs that could be responsible for that object.
 -spec preflist(Key :: binary(), State :: chstate()) ->
-                               [{Index :: integer(), Node :: term()}].
+                               [{Index :: chash:index_as_int(), Node :: term()}].
 preflist(Key, State) -> chash:successors(Key, State?CHSTATE.chring).
 
 %% @doc Return a randomly-chosen node from amongst the owners.
@@ -447,7 +458,7 @@ random_node(State) ->
 
 %% @doc Return a partition index not owned by the node executing this function.
 %%      If this node owns all partitions, return any index.
--spec random_other_index(State :: chstate()) -> integer().
+-spec random_other_index(State :: chstate()) -> chash:index_as_int().
 random_other_index(State) ->
     L = [I || {I,Owner} <- ?MODULE:all_owners(State), Owner =/= node()],
     case L of
@@ -455,7 +466,7 @@ random_other_index(State) ->
         _ -> lists:nth(random:uniform(length(L)), L)
     end.
 
--spec random_other_index(State :: chstate(), Exclude :: [term()]) -> integer() | no_indices.
+-spec random_other_index(State :: chstate(), Exclude :: [term()]) -> chash:index_as_int() | no_indices.
 random_other_index(State, Exclude) when is_list(Exclude) ->
     L = [I || {I, Owner} <- ?MODULE:all_owners(State),
               Owner =/= node(),
@@ -492,7 +503,7 @@ reconcile(ExternState, MyState) ->
     check_tainted(ExternState,
                   "Error: riak_core_ring/reconcile :: "
                   "reconciling tainted external ring"),
-    check_tainted(MyState, 
+    check_tainted(MyState,
                   "Error: riak_core_ring/reconcile :: "
                   "reconciling tainted internal ring"),
     case internal_reconcile(MyState, ExternState) of
@@ -506,20 +517,21 @@ reconcile(ExternState, MyState) ->
 -spec rename_node(State :: chstate(), OldNode :: atom(), NewNode :: atom()) ->
             chstate().
 rename_node(State=?CHSTATE{chring=Ring, nodename=ThisNode, members=Members,
-                           seen=Seen}, OldNode, NewNode) 
+                           claimant=Claimant, seen=Seen}, OldNode, NewNode)
   when is_atom(OldNode), is_atom(NewNode)  ->
     State?CHSTATE{
       chring=lists:foldl(
                fun({Idx, Owner}, AccIn) ->
                        case Owner of
-                           OldNode -> 
+                           OldNode ->
                                chash:update(Idx, NewNode, AccIn);
                            _ -> AccIn
                        end
                end, Ring, riak_core_ring:all_owners(State)),
-      members=proplists:substitute_aliases([{OldNode, NewNode}], Members),
-      seen=proplists:substitute_aliases([{OldNode, NewNode}], Seen),
+      members=orddict:from_list(proplists:substitute_aliases([{OldNode, NewNode}], Members)),
+      seen=orddict:from_list(proplists:substitute_aliases([{OldNode, NewNode}], Seen)),
       nodename=case ThisNode of OldNode -> NewNode; _ -> ThisNode end,
+      claimant=case Claimant of OldNode -> NewNode; _ -> Claimant end,
       vclock=vclock:increment(NewNode, State?CHSTATE.vclock)}.
 
 %% @doc Determine the integer ring index responsible
@@ -548,9 +560,12 @@ future_index(CHashKey, OrigIdx, State) ->
                    undefined | integer(),
                    chstate()) -> integer() | undefined.
 future_index(CHashKey, OrigIdx, NValCheck, State) ->
-    <<CHashInt:160/integer>> = CHashKey,
     OrigCount = num_partitions(State),
     NextCount = future_num_partitions(State),
+    future_index(CHashKey, OrigIdx, NValCheck, OrigCount, NextCount).
+
+future_index(CHashKey, OrigIdx, NValCheck, OrigCount, NextCount) ->
+    <<CHashInt:160/integer>> = CHashKey,
     OrigInc = chash:ring_increment(OrigCount),
     NextInc = chash:ring_increment(NextCount),
 
@@ -632,7 +647,7 @@ update_meta(Key, Val, State) ->
                      true
              end,
     if Change ->
-            M = #meta_entry { 
+            M = #meta_entry {
               lastmod = calendar:datetime_to_gregorian_seconds(
                           calendar:universal_time()),
               value = Val
@@ -719,7 +734,7 @@ get_member_meta(State, Member, Key) ->
                     Value
             end
     end.
-    
+
 %% @doc Set a key in the member metadata orddict
 update_member_meta(Node, State, Member, Key, Val) ->
     VClock = vclock:increment(Node, State?CHSTATE.vclock),
@@ -870,12 +885,31 @@ set_pending_resize(Resizing, Orig) ->
     %% all existing indexes must transfer data when the ring is being resized
     Next = [{Idx, Owner, '$resize', [], awaiting} ||
                {Idx, Owner} <- riak_core_ring:all_owners(Orig)],
+
+    %% Whether or not the ring is shrinking or expanding, some
+    %% ownership may be shared between the old and new ring. To prevent
+    %% degenerate cases where partitions whose ownership does not
+    %% change are transferred a bunch of data which they in turn must
+    %% ignore on each subsequent transfer, we move them to the front
+    %% of the next list which is treated as ordered.
+    FutureOwners = riak_core_ring:all_owners(Resizing),
+    SortedNext = lists:sort(fun({Idx, Owner, _, _, _}, _) ->
+                                    %% we only need to check one element because the end result
+                                    %% is the same as if we checked both:
+                                    %%
+                                    %% true, false -> true
+                                    %% true, true -> true
+                                    %% false, false -> false
+                                    %% false, true -> false
+                                    lists:member({Idx, Owner}, FutureOwners)
+                            end, Next),
+
     %% Resizing is assumed to have a modified chring, we need to put back
     %% the original chring to not install the resized one pre-emptively. The
     %% resized ring is stored in ring metadata for later use
     FutureCHash = chash(Resizing),
     ResetRing = set_chash(Resizing, chash(Orig)),
-    set_resized_ring(set_pending_changes(ResetRing, Next), FutureCHash).
+    set_resized_ring(set_pending_changes(ResetRing, SortedNext), FutureCHash).
 
 -spec maybe_abort_resize(chstate()) -> {boolean(), chstate()}.
 maybe_abort_resize(State) ->
@@ -1073,14 +1107,14 @@ deletion_complete(State, Idx, Mod) ->
     transfer_complete(State, Idx, Mod).
 
 -spec resize_transfers(chstate(), {integer(), term()}) ->
-                              [{{integer(),term()}, ordsets:ordset(), awaiting | complete}].
+                              [resize_transfer()].
 resize_transfers(State, Source) ->
     {ok, Transfers} = get_meta({resize, Source}, [], State),
     Transfers.
 
 -spec set_resize_transfers(chstate(),
                            {integer(), term()},
-                           [{{integer(),term()},ordsets:ordset(),awaiting | complete}]) -> chstate().
+                           [resize_transfer()]) -> chstate().
 set_resize_transfers(State, Source, Transfers) ->
     update_meta({resize, Source}, Transfers, State).
 
@@ -1215,7 +1249,7 @@ ring_ready_info(State0) ->
                                    and lists:member(Node, Members)
                        end, Seen),
     Outdated.
-    
+
 %% @doc Marks a pending transfer as completed.
 -spec handoff_complete(State :: chstate(), Idx :: integer(),
                        Mod :: module()) -> chstate().
@@ -1295,7 +1329,7 @@ pretty_print(Ring, Opts) ->
     case OptLegend of
         true ->
             io:format(Out, "~36..=s Nodes ~36..=s~n", ["", ""]),
-            [begin
+            _ = [begin
                  NodeIndices = [Idx || {Idx,Owner} <- Indices,
                                        Owner =:= Node],
                  RingPercent = length(NodeIndices) * 100 / RingSize,
@@ -1337,7 +1371,7 @@ cancel_transfers(Ring) ->
 %% @doc Incorporate another node's state into our view of the Riak world.
 legacy_reconcile(ExternState, MyState) ->
     case vclock:equal(MyState#chstate.vclock, vclock:fresh()) of
-        true -> 
+        true ->
             {new_ring, #chstate{nodename=MyState#chstate.nodename,
                                 vclock=ExternState#chstate.vclock,
                                 chring=ExternState#chstate.chring,
@@ -1355,7 +1389,7 @@ legacy_reconcile(ExternState, MyState) ->
                                       meta=ExternState#chstate.meta}};
                         false -> {no_change, MyState}
                     end;
-                [] -> 
+                [] ->
                     case legacy_equal_rings(ExternState,MyState) of
                         true -> {no_change, MyState};
                         false -> {new_ring,
@@ -1424,7 +1458,7 @@ pick_val(M1,M2) ->
     case M1#meta_entry.lastmod > M2#meta_entry.lastmod of
         true -> M1;
         false -> M2
-    end.                   
+    end.
 
 %% @private
 internal_reconcile(State, OtherState) ->
@@ -1695,7 +1729,7 @@ update_seen(Node, CState=?CHSTATE{vclock=VClock, seen=Seen}) ->
 equal_cstate(StateA, StateB) ->
     equal_cstate(StateA, StateB, false).
 
-equal_cstate(StateA, StateB, Verbose) ->
+equal_cstate(StateA, StateB, false) ->
     T1 = equal_members(StateA?CHSTATE.members, StateB?CHSTATE.members),
     T2 = vclock:equal(StateA?CHSTATE.rvsn, StateB?CHSTATE.rvsn),
     T3 = equal_seen(StateA, StateB),
@@ -1711,19 +1745,7 @@ equal_cstate(StateA, StateB, Verbose) ->
                            meta=undefined, clustername=undefined},
     T5 = (StateA2 =:= StateB2),
 
-    case Verbose of
-        false ->
-            T1 and T2 and T3 and T4 and T5;
-        true ->
-            Failed =
-                lists:filter(fun({Test,_}) -> Test =:= false end,
-                             [{T1, members},
-                              {T2, rvsn},
-                              {T3, seen},
-                              {T4, ring},
-                              {T5, other}]),
-            Failed
-    end.
+    T1 andalso T2 andalso T3 andalso T4 andalso T5.
 
 %% @private
 equal_members(M1, M2) ->
@@ -1797,8 +1819,7 @@ reconcile_test() ->
     Ring1 = transfer_node(0,x,Ring0),
     %% Only members and seen should have changed
     {new_ring, Ring2} = reconcile(fresh(2,someone_else),Ring1),
-    ?assertMatch([{false, members}, {false, seen}],
-                 equal_cstate(Ring1, Ring2, true)),
+    ?assertNot(equal_cstate(Ring1, Ring2, false)),
     RingB0 = fresh(2,node()),
     RingB1 = transfer_node(0,x,RingB0),
     RingB2 = RingB1?CHSTATE{nodename=b},
@@ -1839,7 +1860,7 @@ rename_test() ->
     ?assertEqual('new@new', owner_node(Ring)),
     ?assertEqual(['new@new'], all_members(Ring)).
 
-exclusion_test() ->    
+exclusion_test() ->
     Ring0 = fresh(2, node()),
     Ring1 = transfer_node(0,x,Ring0),
     ?assertEqual(0, random_other_index(Ring1,[730750818665451459101842416358141509827966271488])),
@@ -1864,7 +1885,7 @@ membership_test() ->
 
     RingA4 = remove_member(nodeA, RingA3, nodeC),
     ?assertEqual([nodeA, nodeB], all_members(RingA4)),
-    
+
     %% Node should stay removed
     {_, RingA5} = reconcile(RingA3, RingA4),
     ?assertEqual([nodeA, nodeB], all_members(RingA5)),
@@ -1913,7 +1934,7 @@ membership_test() ->
      end || {StatusA, _} <- Priority,
             {StatusB, _} <- Priority],
     ok.
-    
+
 ring_version_test() ->
     Ring1 = fresh(nodeA),
     Ring2 = add_member(node(), Ring1, nodeA),

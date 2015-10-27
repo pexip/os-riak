@@ -36,6 +36,7 @@ class CorruptionTest {
     tiny_cache_ = NewLRUCache(100);
     options_.env = &env_;
     dbname_ = test::TmpDir() + "/db_test";
+    dbname_ = MakeTieredDbname(dbname_, options_);
     DestroyDB(dbname_, options_);
 
     db_ = NULL;
@@ -122,7 +123,7 @@ class CorruptionTest {
     if (leveldb::kTableFile!=filetype)
         dirname=dbname_;
     else
-        dirname=MakeDirName2(dbname_, level, "sst");
+        dirname=MakeDirName2(options_, level, "sst");
 
     ASSERT_OK(env_.GetChildren(dirname, &filenames));
 
@@ -221,7 +222,9 @@ TEST(CorruptionTest, NewFileErrorDuringWrite) {
   const int num = 3 + (Options().write_buffer_size / kValueSize);
   std::string value_storage;
   Status s;
-  for (int i = 0; s.ok() && i < num; i++) {
+  for (int i = 0; 
+       s.ok() && i < num && 0==env_.num_writable_file_errors_; 
+       i++) {
     WriteBatch batch;
     batch.Put("a", Value(100, &value_storage));
     s = db_->Write(WriteOptions(), &batch);
@@ -323,7 +326,12 @@ TEST(CorruptionTest, CompactionInputErrorParanoid) {
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
 
   // Fill levels >= 1 so memtable compaction outputs to level 1
-  for (int level = 1; level < config::kNumLevels; level++) {
+  //  matthewv 1/10/14 - what does "levels" have to do with this,
+  //  switching to compaction trigger.
+  // 7/10/14 - compaction starts between 4 and 6 files ... assume 4
+  //  (will make a new, descriptive constant for 4)
+  for (int level = Property("leveldb.num-files-at-level0")+1;
+       level < (config::kL0_GroomingTrigger -1); level++) {
     dbi->Put(WriteOptions(), "", "begin");
     dbi->Put(WriteOptions(), "~", "end");
     dbi->TEST_CompactMemTable();

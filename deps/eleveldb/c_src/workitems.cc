@@ -19,6 +19,9 @@
 // under the License.
 //
 // -------------------------------------------------------------------
+
+#include <syslog.h>
+
 #ifndef __ELEVELDB_DETAIL_HPP
     #include "detail.hpp"
 #endif
@@ -153,7 +156,7 @@ OpenTask::OpenTask(
 work_result
 OpenTask::operator()()
 {
-    DbObject * db_ptr;
+    void * db_ptr_ptr;
     leveldb::DB *db(0);
 
     leveldb::Status status = leveldb::DB::Open(*open_options, db_name, &db);
@@ -161,13 +164,13 @@ OpenTask::operator()()
     if(!status.ok())
         return error_tuple(local_env(), ATOM_ERROR_DB_OPEN, status);
 
-    db_ptr=DbObject::CreateDbObject(db, open_options);
+    db_ptr_ptr=DbObject::CreateDbObject(db, open_options);
 
     // create a resource reference to send erlang
-    ERL_NIF_TERM result = enif_make_resource(local_env(), db_ptr);
+    ERL_NIF_TERM result = enif_make_resource(local_env(), db_ptr_ptr);
 
     // clear the automatic reference from enif_alloc_resource in CreateDbObject
-    enif_release_resource(db_ptr);
+    enif_release_resource(db_ptr_ptr);
 
     return work_result(local_env(), ATOM_OK, result);
 
@@ -182,8 +185,45 @@ OpenTask::operator()()
 work_result
 MoveTask::operator()()
 {
-    leveldb::Iterator* itr = m_ItrWrap->get();
+    leveldb::Iterator* itr;
 
+    itr=m_ItrWrap->get();
+
+
+//
+// race condition of prefetch clearing db iterator while
+//  async_iterator_move looking at it.
+//
+
+    // iterator_refresh operation
+    if (m_ItrWrap->m_Options.iterator_refresh && m_ItrWrap->m_StillUse)
+    {
+        struct timeval tv;
+
+        gettimeofday(&tv, NULL);
+
+        if (m_ItrWrap->m_IteratorStale < tv.tv_sec || NULL==itr)
+        {
+            m_ItrWrap->RebuildIterator();
+            itr=m_ItrWrap->get();
+
+            // recover position
+            if (NULL!=itr && 0!=m_ItrWrap->m_RecentKey.size())
+            {
+                leveldb::Slice key_slice(m_ItrWrap->m_RecentKey);
+
+                itr->Seek(key_slice);
+                m_ItrWrap->m_StillUse=itr->Valid();
+                if (!m_ItrWrap->m_StillUse)
+                {
+                    itr=NULL;
+                    m_ItrWrap->PurgeIterator();
+                }   // if
+            }   // if
+        }   // if
+    }   // if
+
+    // back to normal operation
     if(NULL == itr)
         return work_result(local_env(), ATOM_ERROR, ATOM_ITERATOR_CLOSED);
 
@@ -194,6 +234,7 @@ MoveTask::operator()()
         case LAST:  itr->SeekToLast();  break;
 
         case PREFETCH:
+        case PREFETCH_STOP:
         case NEXT:  if(itr->Valid()) itr->Next(); break;
 
         case PREV:  if(itr->Valid()) itr->Prev(); break;
@@ -215,6 +256,25 @@ MoveTask::operator()()
 
     }   // switch
 
+    // Post processing before telling the world the results
+    //  (while only one thread might be looking at objects)
+    if (m_ItrWrap->m_Options.iterator_refresh)
+    {
+        if (itr->Valid())
+        {
+            m_ItrWrap->m_RecentKey.assign(itr->key().data(), itr->key().size());
+        }   // if
+        else if (PREFETCH_STOP!=action)
+        {
+            // release iterator now, not later
+            m_ItrWrap->m_StillUse=false;
+            m_ItrWrap->PurgeIterator();
+            itr=NULL;
+        }   // else
+    }   // if
+
+    // debug syslog(LOG_ERR, "                     MoveItem::operator() %d, %d, %d",
+    //              action, m_ItrWrap->m_StillUse, m_ItrWrap->m_HandoffAtomic);
 
     // who got back first, us or the erlang loop
     if (compare_and_swap(&m_ItrWrap->m_HandoffAtomic, 0, 1))
@@ -228,9 +288,9 @@ MoveTask::operator()()
         // setup next race for the response
         m_ItrWrap->m_HandoffAtomic=0;
 
-        if(itr->Valid())
+        if(NULL!=itr && itr->Valid())
         {
-            if (PREFETCH==action)
+            if (PREFETCH==action && m_ItrWrap->m_PrefetchStarted)
                 prepare_recycle();
 
             // erlang is waiting, send message
@@ -260,7 +320,7 @@ MoveTask::local_env()
 
     if (!terms_set)
     {
-        caller_ref_term = enif_make_copy(local_env_, m_ItrWrap->m_Snap->itr_ref);
+        caller_ref_term = enif_make_copy(local_env_, m_ItrWrap->itr_ref);
         caller_pid_term = enif_make_pid(local_env_, &local_pid);
         terms_set=true;
     }   // if

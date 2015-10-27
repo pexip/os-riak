@@ -1,0 +1,7 @@
+/.eunit
+/doc
+/ebin
+/deps
+/.rebar
+TEST-*.xml
+*.beam

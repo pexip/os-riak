@@ -2,7 +2,7 @@
 //
 // eleveldb: Erlang Wrapper for LevelDB (http://code.google.com/p/leveldb/)
 //
-// Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2011-2014 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -204,14 +204,14 @@ class GetTask : public WorkTask
 {
 protected:
     std::string                        m_Key;
-    leveldb::ReadOptions*              options;
+    leveldb::ReadOptions              options;
 
 public:
     GetTask(ErlNifEnv *_caller_env,
             ERL_NIF_TERM _caller_ref,
             DbObject *_db_handle,
             ERL_NIF_TERM _key_term,
-            leveldb::ReadOptions *_options)
+            leveldb::ReadOptions &_options)
         : WorkTask(_caller_env, _caller_ref, _db_handle),
         options(_options)
         {
@@ -223,7 +223,6 @@ public:
 
     virtual ~GetTask()
     {
-        delete options;
     }
 
     virtual work_result operator()()
@@ -232,7 +231,7 @@ public:
         BinaryValue value(local_env(), value_bin);
         leveldb::Slice key_slice(m_Key);
 
-        leveldb::Status status = m_DbPtr->m_Db->Get(*options, key_slice, &value);
+        leveldb::Status status = m_DbPtr->m_Db->Get(options, key_slice, &value);
 
         if(!status.ok())
             return work_result(ATOM_NOT_FOUND);
@@ -253,51 +252,42 @@ class IterTask : public WorkTask
 protected:
 
     const bool keys_only;
-    leveldb::ReadOptions *options;
+    leveldb::ReadOptions options;
 
 public:
     IterTask(ErlNifEnv *_caller_env,
              ERL_NIF_TERM _caller_ref,
              DbObject *_db_handle,
              const bool _keys_only,
-             leveldb::ReadOptions *_options)
+             leveldb::ReadOptions &_options)
         : WorkTask(_caller_env, _caller_ref, _db_handle),
         keys_only(_keys_only), options(_options)
     {}
 
     virtual ~IterTask()
     {
-        // options should be NULL at this point
-        delete options;
     }
 
     virtual work_result operator()()
     {
         ItrObject * itr_ptr;
-        const leveldb::Snapshot * snapshot;
-        leveldb::Iterator * iterator;
+        void * itr_ptr_ptr;
 
         // NOTE: transfering ownership of options to ItrObject
-        itr_ptr=ItrObject::CreateItrObject(m_DbPtr.get(), keys_only, options);
-
-        snapshot = m_DbPtr->m_Db->GetSnapshot();
-        itr_ptr->m_Snapshot.assign(new LevelSnapshotWrapper(m_DbPtr.get(), snapshot));
-        options->snapshot = snapshot;
+        itr_ptr_ptr=ItrObject::CreateItrObject(m_DbPtr.get(), keys_only, options);
 
         // Copy caller_ref to reuse in future iterator_move calls
-        itr_ptr->m_Snapshot->itr_ref_env = enif_alloc_env();
-        itr_ptr->m_Snapshot->itr_ref = enif_make_copy(itr_ptr->m_Snapshot->itr_ref_env,
-                                                      caller_ref());
+        itr_ptr=*(ItrObject**)itr_ptr_ptr;
+        itr_ptr->itr_ref_env = enif_alloc_env();
+        itr_ptr->itr_ref = enif_make_copy(itr_ptr->itr_ref_env, caller_ref());
 
-        iterator = m_DbPtr->m_Db->NewIterator(*options);
-        itr_ptr->m_Iter.assign(new LevelIteratorWrapper(m_DbPtr.get(), itr_ptr->m_Snapshot.get(),
-                                                        iterator, keys_only));
+        itr_ptr->m_Iter.assign(new LevelIteratorWrapper(itr_ptr, keys_only,
+                                                        options, itr_ptr->itr_ref));
 
-        ERL_NIF_TERM result = enif_make_resource(local_env(), itr_ptr);
+        ERL_NIF_TERM result = enif_make_resource(local_env(), itr_ptr_ptr);
 
         // release reference created during CreateItrObject()
-        enif_release_resource(itr_ptr);
-        options=NULL;  // ptr ownership given to ItrObject
+        enif_release_resource(itr_ptr_ptr);
 
         return work_result(local_env(), ATOM_OK, result);
     }   // operator()
@@ -308,7 +298,7 @@ public:
 class MoveTask : public WorkTask
 {
 public:
-    typedef enum { FIRST, LAST, NEXT, PREV, SEEK, PREFETCH } action_t;
+    typedef enum { FIRST, LAST, NEXT, PREV, SEEK, PREFETCH, PREFETCH_STOP } action_t;
 
 protected:
     ReferencePtr<LevelIteratorWrapper> m_ItrWrap;             //!< access to database, and holds reference
@@ -322,7 +312,7 @@ public:
     // No seek target:
     MoveTask(ErlNifEnv *_caller_env, ERL_NIF_TERM _caller_ref,
              LevelIteratorWrapper * IterWrap, action_t& _action)
-        : WorkTask(NULL, _caller_ref),
+        : WorkTask(NULL, _caller_ref, IterWrap->m_DbPtr.get()),
         m_ItrWrap(IterWrap), action(_action)
     {
         // special case construction
@@ -334,7 +324,7 @@ public:
     MoveTask(ErlNifEnv *_caller_env, ERL_NIF_TERM _caller_ref,
              LevelIteratorWrapper * IterWrap, action_t& _action,
              std::string& _seek_target)
-        : WorkTask(NULL, _caller_ref),
+        : WorkTask(NULL, _caller_ref, IterWrap->m_DbPtr.get()),
         m_ItrWrap(IterWrap), action(_action),
         seek_target(_seek_target)
         {
@@ -352,6 +342,102 @@ public:
     virtual void recycle();
 
 };  // class MoveTask
+
+
+/**
+ * Background object for async databass close
+ */
+
+class CloseTask : public WorkTask
+{
+protected:
+
+public:
+
+    CloseTask(ErlNifEnv* _owner_env, ERL_NIF_TERM _caller_ref,
+              DbObject * _db_handle)
+        : WorkTask(_owner_env, _caller_ref, _db_handle)
+    {}
+
+    virtual ~CloseTask()
+    {
+    }
+
+    virtual work_result operator()()
+    {
+        DbObject * db_ptr;
+
+        // get db pointer then clear reference count to it
+        db_ptr=m_DbPtr.get();
+        m_DbPtr.assign(NULL);
+
+        if (NULL!=db_ptr)
+        {
+            // set closing flag, this is blocking
+            db_ptr->InitiateCloseRequest();
+
+            // db_ptr no longer valid
+            db_ptr=NULL;
+
+            return(work_result(ATOM_OK));
+        }   // if
+        else
+        {
+            return work_result(local_env(), ATOM_ERROR, ATOM_BADARG);
+        }   // else
+    }
+
+};  // class CloseTask
+
+
+/**
+ * Background object for async iterator close
+ */
+
+class ItrCloseTask : public WorkTask
+{
+protected:
+    ReferencePtr<ItrObject> m_ItrPtr;
+
+public:
+
+    ItrCloseTask(ErlNifEnv* _owner_env, ERL_NIF_TERM _caller_ref,
+              ItrObject * _itr_handle)
+        : WorkTask(_owner_env, _caller_ref),
+        m_ItrPtr(_itr_handle)
+    {}
+
+    virtual ~ItrCloseTask()
+    {
+    }
+
+    virtual work_result operator()()
+    {
+        ItrObject * itr_ptr;
+
+        // get iterator pointer then clear reference count to it
+        itr_ptr=m_ItrPtr.get();
+        m_ItrPtr.assign(NULL);
+
+        if (NULL!=itr_ptr)
+        {
+            // set closing flag, this is blocking
+            itr_ptr->InitiateCloseRequest();
+
+            // itr_ptr no longer valid
+            itr_ptr=NULL;
+
+            return(work_result(ATOM_OK));
+//            return(work_result());  // no message
+        }   // if
+        else
+        {
+            return work_result(local_env(), ATOM_ERROR, ATOM_BADARG);
+//            return(work_result());  // no message
+        }   // else
+    }
+
+};  // class ItrCloseTask
 
 } // namespace eleveldb
 

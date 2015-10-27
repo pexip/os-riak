@@ -17,68 +17,72 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
-
+%%
 %% @doc SSL and Authorization enforcement for administration URLs.
+
 -module(riak_control_security).
 
 -export([scheme_is_available/2,
          enforce_auth/2,
-         https_redirect_loc/1,
          csrf_token/2,
          is_valid_csrf_token/2,
          is_null_origin/1,
          is_protected/2]).
 
+-include("riak_control.hrl").
+
 -type context() :: term() | undefined.
 -type csrf_token() :: list() | undefined.
 
--include("riak_control.hrl").
-
-%% if riak_control has an auth scheme selected, then we enforce
-%% use of HTTPS and will redirect the user to the HTTPS version
-%% of the page requested
+%% @doc Enforce use of HTTPS only when a valid auth scheme is enabled.
+-spec scheme_is_available(wrq:reqdata(), context()) ->
+    {boolean(), wrq:reqdata(), context()}.
 scheme_is_available(RD, Ctx) ->
-    case app_helper:get_env(riak_control, auth, none) of
-        none ->
-            {true, RD, Ctx};
-        _ ->
-            case wrq:scheme(RD) of
-                https ->
+    case app_helper:get_env(riak_control, force_ssl, undefined) of
+        undefined ->
+            %% Handle upgrade, where we want to preserve existing
+            %% behavior.
+            case app_helper:get_env(riak_control, auth, none) of
+                none ->
                     {true, RD, Ctx};
                 _ ->
-                    https_redirect(RD,Ctx)
-            end
-    end.
-
-%% get the https location to redirect to (callable w/o a request)
-https_redirect_loc(Path) ->
-    case app_helper:get_env(riak_control, enabled, false) of
-        true ->
-            case app_helper:get_env(riak_core, https) of
-                [{Host,Port}|_] ->
-                    {ok,["https://",Host,":",integer_to_list(Port),Path]};
-                _ ->
-                    undefined
+                    redirect_if_not_ssl(RD, Ctx)
             end;
+        true ->
+            redirect_if_not_ssl(RD, Ctx);
         _ ->
-            undefined
+            {true, RD, Ctx}
     end.
 
-%% set the redirect header and where to go with it
+%% @doc Redirect if request is not SSL.
+-spec redirect_if_not_ssl(wrq:reqdata(), context()) ->
+    {boolean(), wrq:reqdata(), context()}.
+redirect_if_not_ssl(ReqData, Context) ->
+    case wrq:scheme(ReqData) of
+        https ->
+            {true, ReqData, Context};
+        _ ->
+            https_redirect(ReqData, Context)
+    end.
+
+%% @doc Perform http redirect to ssl.
+-spec https_redirect(wrq:reqdata(), context()) ->
+    {{halt, 303}, wrq:reqdata(), context()}.
 https_redirect(RD,Ctx) ->
-    Path=wrq:raw_path(RD),
-    Loc=case https_redirect_loc(Path) of
-            {ok,Dest} ->
-                Dest;
-            _ ->
-                Host=string:join(wrq:host_tokens(RD),"."),
-                ["https://",Host,Path]
-        end,
-    {{halt,303},wrq:set_resp_header("Location",Loc,RD),Ctx}.
+    Path = wrq:raw_path(RD),
+    Host = wrq:sock(RD),
+    Bindings = app_helper:get_env(riak_core, https, []),
+    Location = case lists:keyfind(Host, 1, Bindings) of
+        {_, Port} ->
+            ["https://", Host, ":", integer_to_list(Port), Path];
+        _ ->
+            ["https://", Host, Path]
+    end,
+    {{halt,303}, wrq:set_resp_header("Location", Location, RD), Ctx}.
 
 %% @doc Intended to be called from a webmachine resource's
-%% is_authorized function.  The return value is a valid resource
-%% return value (`{Result, ReqData, Context}').
+%%      is_authorized function.  The return value is a valid resource
+%%      return value (`{Result, ReqData, Context}').
 %%
 %% This function checks for valid authentication in the request.  If
 %% the authentication is valid, `true' is returned.  If it is invalid,
@@ -92,6 +96,8 @@ https_redirect(RD,Ctx) ->
 %%
 %%    - `none'     :: No authentication.
 %%
+-spec enforce_auth(wrq:reqdata(), context()) ->
+    {boolean(), wrq:reqdata(), context()}.
 enforce_auth(RD, Ctx) ->
     case app_helper:get_env(riak_control,auth,none) of
         none ->
@@ -105,6 +111,9 @@ enforce_auth(RD, Ctx) ->
             end
     end.
 
+%% @doc Enforce basic auth.
+-spec enforce_basic_auth(wrq:reqdata(), context(), term(), atom()) ->
+    {boolean(), wrq:reqdata(), context()}.
 enforce_basic_auth(RD, Ctx, Base64, Auth) ->
     Str = base64:mime_decode_to_string(Base64),
     case string:tokens(Str, ":") of
@@ -114,19 +123,25 @@ enforce_basic_auth(RD, Ctx, Base64, Auth) ->
             {?ADMIN_AUTH_HEAD, RD, Ctx}
     end.
 
+%% @doc Enforce user and password match.
+-spec enforce_user_pass(wrq:reqdata(), context(), nonempty_string(),
+                        nonempty_string(), atom()) ->
+    {boolean(), wrq:reqdata(), context()}.
 enforce_user_pass(RD, Ctx, User, Pass, Auth) ->
     case valid_userpass(User, Pass, Auth) of
         true ->
             {true, RD, Ctx};
-        false ->
+        _ ->
             {?ADMIN_AUTH_HEAD, RD, Ctx}
     end.
 
-%% validate the username and password with the given auth style
+%% @doc Validate username and password given a particular auth style.
+-spec valid_userpass(nonempty_string(), nonempty_string(),
+                     atom()) -> boolean().
 valid_userpass(_User, _Pass, none) ->
     true;
 valid_userpass(User, Pass, userlist) ->
-    Users=app_helper:get_env(riak_control, userlist, []),
+    Users = app_helper:get_env(riak_control, userlist, []),
     proplists:get_value(User, Users) == Pass;
 valid_userpass(_User, _Pass, _Auth) ->
     error_logger:warning_msg("Unknown auth type '~p'", [_Auth]),
@@ -168,7 +183,7 @@ is_protected(ReqData, Context) ->
     is_protected_method(ReqData).
 
 %% @doc Check if the Origin header is "null". This is useful to look for
-%% attempts at CSRF, but is not a complete answer to the problem.
+%%      attempts at CSRF, but is not a complete answer to the problem.
 -spec is_null_origin(wrq:reqdata()) -> boolean().
 is_null_origin(ReqData) ->
     case wrq:get_req_header("Origin", ReqData) of

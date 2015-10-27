@@ -44,7 +44,7 @@
 %% %% Select all events where both 'a' and 'b' exists and are greater than 0.
 %% glc:all([glc:gt(a, 0), glc:gt(b, 0)]).
 %% %% Select all events where 'a' or 'b' exists and are greater than 0.
-%% glc:any([glc:get(a, 0), glc:gt(b, 0)]).
+%% glc:any([glc:gt(a, 0), glc:gt(b, 0)]).
 %% '''
 %%
 %% === Handling output events ===
@@ -74,7 +74,8 @@
     lt/2,
     eq/2,
     gt/2,
-    wc/1
+    wc/1,
+    nf/1
 ]).
 
 -export([
@@ -85,6 +86,9 @@
 ]).
 
 -export([
+    input/1,
+    output/1,
+    filter/1,
     union/1
 ]).
 
@@ -109,6 +113,10 @@ gt(Key, Term) ->
 -spec wc(atom()) -> glc_ops:op().
 wc(Key) ->
     glc_ops:wc(Key).
+
+-spec nf(atom()) -> glc_ops:op().
+nf(Key) ->
+    glc_ops:nf(Key).
 
 %% @doc Filter the input using multiple filters.
 %%
@@ -169,11 +177,11 @@ union(Queries) ->
 %% data associated with the query must be released using the {@link delete/1}
 %% function. The name of the query module is expected to be unique.
 %% The counters are reset by default, unless Reset is set to false 
--spec compile(atom(), list()) -> {ok, atom()}.
+-spec compile(atom(), glc_ops:op() | [glc_ops:op()]) -> {ok, atom()}.
 compile(Module, Query) ->
     compile(Module, Query, true).
 
--spec compile(atom(), list(), boolean()) -> {ok, atom()}.
+-spec compile(atom(), glc_ops:op() | [glc_ops:op()], boolean()) -> {ok, atom()}.
 compile(Module, Query, Reset) ->
     {ok, ModuleData} = module_data(Module, Query),
     case glc_code:compile(Module, ModuleData) of
@@ -192,6 +200,22 @@ compile(Module, Query, Reset) ->
 handle(Module, Event) ->
     Module:handle(Event).
 
+%% @doc The number of input events for this query module.
+-spec input(atom()) -> non_neg_integer().
+input(Module) ->
+    Module:info(input).
+
+%% @doc The number of output events for this query module.
+-spec output(atom()) -> non_neg_integer().
+output(Module) ->
+    Module:info(output).
+
+%% @doc The number of filtered events for this query module.
+-spec filter(atom()) -> non_neg_integer().
+filter(Module) ->
+    Module:info(filter).
+
+
 %% @doc Release a compiled query.
 %%
 %% This releases all resources allocated by a compiled query. The query name
@@ -204,9 +228,9 @@ delete(Module) ->
     ManageParams = manage_params_name(Module),
     ManageCounts = manage_counts_name(Module),
 
-    [ begin 
-        supervisor:terminate_child(Sup, Name),
-        supervisor:delete_child(Sup, Name)
+    _ = [ begin 
+        ok = supervisor:terminate_child(Sup, Name),
+        ok = supervisor:delete_child(Sup, Name)
       end || {Sup, Name} <- 
         [{gr_manager_sup, ManageParams}, {gr_manager_sup, ManageCounts},
          {gr_param_sup, Params}, {gr_counter_sup, Counts}]
@@ -255,16 +279,16 @@ module_tables(Module) ->
     ManageCounts = manage_counts_name(Module),
     Counters = [{input,0}, {filter,0}, {output,0}],
 
-    supervisor:start_child(gr_param_sup, 
+    _ = supervisor:start_child(gr_param_sup, 
         {Params, {gr_param, start_link, [Params]}, 
         transient, brutal_kill, worker, [Params]}),
-    supervisor:start_child(gr_counter_sup, 
+    _ = supervisor:start_child(gr_counter_sup, 
         {Counts, {gr_counter, start_link, [Counts]}, 
         transient, brutal_kill, worker, [Counts]}),
-    supervisor:start_child(gr_manager_sup, 
+    _ = supervisor:start_child(gr_manager_sup, 
         {ManageParams, {gr_manager, start_link, [ManageParams, Params, []]},
         transient, brutal_kill, worker, [ManageParams]}),
-    supervisor:start_child(gr_manager_sup, {ManageCounts, 
+    _ = supervisor:start_child(gr_manager_sup, {ManageCounts, 
         {gr_manager, start_link, [ManageCounts, Counts, Counters]},
         transient, brutal_kill, worker, [ManageCounts]}),
     [{params,Params}, {counters, Counts}].
@@ -392,9 +416,35 @@ events_test_() ->
                     ?assertEqual(1, Mod:info(output))
                 end
             },
+            {"opfilter wildcard test",
+                fun() ->
+                    {compiled, Mod} = setup_query(testmod8, glc:wc(a)),
+                    glc:handle(Mod, gre:make([{b, 2}], [list])),
+                    ?assertEqual(1, Mod:info(input)),
+                    ?assertEqual(1, Mod:info(filter)),
+                    ?assertEqual(0, Mod:info(output)),
+                    glc:handle(Mod, gre:make([{a, 2}], [list])),
+                    ?assertEqual(2, Mod:info(input)),
+                    ?assertEqual(1, Mod:info(filter)),
+                    ?assertEqual(1, Mod:info(output))
+                end
+            },
+            {"opfilter notfound test",
+                fun() ->
+                    {compiled, Mod} = setup_query(testmod9, glc:nf(a)),
+                    glc:handle(Mod, gre:make([{a, 2}], [list])),
+                    ?assertEqual(1, Mod:info(input)),
+                    ?assertEqual(1, Mod:info(filter)),
+                    ?assertEqual(0, Mod:info(output)),
+                    glc:handle(Mod, gre:make([{b, 2}], [list])),
+                    ?assertEqual(2, Mod:info(input)),
+                    ?assertEqual(1, Mod:info(filter)),
+                    ?assertEqual(1, Mod:info(output))
+                end
+            },
             {"opfilter greater than test",
                 fun() ->
-                    {compiled, Mod} = setup_query(testmod8, glc:gt(a, 1)),
+                    {compiled, Mod} = setup_query(testmod10, glc:gt(a, 1)),
                     glc:handle(Mod, gre:make([{'a', 2}], [list])),
                     ?assertEqual(1, Mod:info(input)),
                     ?assertEqual(0, Mod:info(filter)),
@@ -406,7 +456,7 @@ events_test_() ->
             },
             {"opfilter less than test",
                 fun() ->
-                    {compiled, Mod} = setup_query(testmod9, glc:lt(a, 1)),
+                    {compiled, Mod} = setup_query(testmod11, glc:lt(a, 1)),
                     glc:handle(Mod, gre:make([{'a', 0}], [list])),
                     ?assertEqual(1, Mod:info(input)),
                     ?assertEqual(0, Mod:info(filter)),
@@ -419,7 +469,7 @@ events_test_() ->
             },
             {"allholds op test",
                 fun() ->
-                    {compiled, Mod} = setup_query(testmod10,
+                    {compiled, Mod} = setup_query(testmod12,
                         glc:all([glc:eq(a, 1), glc:eq(b, 2)])),
                     glc:handle(Mod, gre:make([{'a', 1}], [list])),
                     glc:handle(Mod, gre:make([{'a', 2}], [list])),
@@ -437,7 +487,7 @@ events_test_() ->
             },
             {"anyholds op test",
                 fun() ->
-                    {compiled, Mod} = setup_query(testmod11,
+                    {compiled, Mod} = setup_query(testmod13,
                         glc:any([glc:eq(a, 1), glc:eq(b, 2)])),
                     glc:handle(Mod, gre:make([{'a', 2}], [list])),
                     glc:handle(Mod, gre:make([{'b', 1}], [list])),
@@ -452,7 +502,7 @@ events_test_() ->
             {"with function test",
                 fun() ->
                     Self = self(),
-                    {compiled, Mod} = setup_query(testmod12,
+                    {compiled, Mod} = setup_query(testmod14,
                         glc:with(glc:eq(a, 1), fun(Event) -> Self ! gre:fetch(a, Event) end)),
                     glc:handle(Mod, gre:make([{a,1}], [list])),
                     ?assertEqual(1, Mod:info(output)),
@@ -461,7 +511,7 @@ events_test_() ->
             },
             {"delete test",
                 fun() ->
-                    {compiled, Mod} = setup_query(testmod13, glc:null(false)),
+                    {compiled, Mod} = setup_query(testmod15, glc:null(false)),
                     ?assert(is_atom(Mod:table(params))),
                     ?assertMatch([_|_], gr_param:info(Mod:table(params))),
                     ?assert(is_list(code:which(Mod))),
@@ -481,7 +531,7 @@ events_test_() ->
             },
             {"reset counters test",
                 fun() ->
-                    {compiled, Mod} = setup_query(testmod14,
+                    {compiled, Mod} = setup_query(testmod16,
                         glc:any([glc:eq(a, 1), glc:eq(b, 2)])),
                     glc:handle(Mod, gre:make([{'a', 2}], [list])),
                     glc:handle(Mod, gre:make([{'b', 1}], [list])),
@@ -510,7 +560,7 @@ events_test_() ->
             {"ets data recovery test",
                 fun() ->
                     Self = self(),
-                    {compiled, Mod} = setup_query(testmod15,
+                    {compiled, Mod} = setup_query(testmod17,
                         glc:with(glc:eq(a, 1), fun(Event) -> Self ! gre:fetch(a, Event) end)),
                     glc:handle(Mod, gre:make([{a,1}], [list])),
                     ?assertEqual(1, Mod:info(output)),

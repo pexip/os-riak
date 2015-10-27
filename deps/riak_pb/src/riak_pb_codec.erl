@@ -47,23 +47,30 @@
          decode_commit_hooks/1
         ]).
 
-%% @doc Bucket properties that store module/function pairs, e.g.
+%% @type modfun_property().
+%%
+%% Bucket properties that store module/function pairs, e.g.
 %% commit hooks, hash functions, link functions, will be in one of
 %% these forms. More specifically:
 %%
+%% ```
 %% chash_keyfun :: {module(), function()}
 %% linkfun :: {modfun, module(), function()}
-%% precommit, postcommit :: [ {struct, [{binary(), binary()}]} ]
+%% precommit, postcommit :: [ {struct, [{binary(), binary()}]} ]'''
 %% @end
 -type modfun_property() :: {module(), function()} | {modfun, module(), function()} | {struct, [{binary(), binary()}]}.
 
-%% @doc Fields that can be specified in a commit hook must be
-%% binaries. The valid values are <<"mod">>, <<"fun">>, <<"name">>.
+%% @type commit_hook_field().
+%%
+%% Fields that can be specified in a commit hook must be
+%% binaries. The valid values are `<<"mod">>, <<"fun">>, <<"name">>'.
 %% Note that "mod" and "fun" must be used together, and "name" cannot
 %% be used if the other two are present.
 -type commit_hook_field() :: binary().
 
-%% @doc Bucket properties that are commit hooks have this format.
+%% @type commit_hook_property().
+%%
+%% Bucket properties that are commit hooks have this format.
 -type commit_hook_property() :: [ {struct, [{commit_hook_field(), binary()}]} ].
 
 %% @doc Create an iolist of msg code and protocol buffer
@@ -88,100 +95,16 @@ decode(MsgCode, MsgData) ->
 %% @doc Converts a message code into the symbolic message
 %% name. Replaces `riakc_pb:msg_type/1'.
 -spec msg_type(integer()) -> atom().
-msg_type(0) -> rpberrorresp;
-msg_type(1) -> rpbpingreq;
-msg_type(2) -> rpbpingresp;
-msg_type(3) -> rpbgetclientidreq;
-msg_type(4) -> rpbgetclientidresp;
-msg_type(5) -> rpbsetclientidreq;
-msg_type(6) -> rpbsetclientidresp;
-msg_type(7) -> rpbgetserverinforeq;
-msg_type(8) -> rpbgetserverinforesp;
-msg_type(9) -> rpbgetreq;
-msg_type(10) -> rpbgetresp;
-msg_type(11) -> rpbputreq;
-msg_type(12) -> rpbputresp;
-msg_type(13) -> rpbdelreq;
-msg_type(14) -> rpbdelresp;
-msg_type(15) -> rpblistbucketsreq;
-msg_type(16) -> rpblistbucketsresp;
-msg_type(17) -> rpblistkeysreq;
-msg_type(18) -> rpblistkeysresp;
-msg_type(19) -> rpbgetbucketreq;
-msg_type(20) -> rpbgetbucketresp;
-msg_type(21) -> rpbsetbucketreq;
-msg_type(22) -> rpbsetbucketresp;
-msg_type(23) -> rpbmapredreq;
-msg_type(24) -> rpbmapredresp;
-msg_type(25) -> rpbindexreq;
-msg_type(26) -> rpbindexresp;
-msg_type(27) -> rpbsearchqueryreq;
-msg_type(28) -> rpbsearchqueryresp;
-msg_type(29) -> rpbresetbucketreq;
-msg_type(30) -> rpbresetbucketresp;
-msg_type(40) -> rpbcsbucketreq;
-msg_type(41) -> rpbcsbucketresp;
-msg_type(50) -> rpbcounterupdatereq;
-msg_type(51) -> rpbcounterupdateresp;
-msg_type(52) -> rpbcountergetreq;
-msg_type(53) -> rpbcountergetresp;
-msg_type(_) -> undefined.
+msg_type(Int) -> riak_pb_messages:msg_type(Int).
 
 %% @doc Converts a symbolic message name into a message code. Replaces
 %% `riakc_pb:msg_code/1'.
 -spec msg_code(atom()) -> integer().
-msg_code(rpberrorresp)           -> 0;
-msg_code(rpbpingreq)             -> 1;
-msg_code(rpbpingresp)            -> 2;
-msg_code(rpbgetclientidreq)      -> 3;
-msg_code(rpbgetclientidresp)     -> 4;
-msg_code(rpbsetclientidreq)      -> 5;
-msg_code(rpbsetclientidresp)     -> 6;
-msg_code(rpbgetserverinforeq)    -> 7;
-msg_code(rpbgetserverinforesp)   -> 8;
-msg_code(rpbgetreq)              -> 9;
-msg_code(rpbgetresp)             -> 10;
-msg_code(rpbputreq)              -> 11;
-msg_code(rpbputresp)             -> 12;
-msg_code(rpbdelreq)              -> 13;
-msg_code(rpbdelresp)             -> 14;
-msg_code(rpblistbucketsreq)      -> 15;
-msg_code(rpblistbucketsresp)     -> 16;
-msg_code(rpblistkeysreq)         -> 17;
-msg_code(rpblistkeysresp)        -> 18;
-msg_code(rpbgetbucketreq)        -> 19;
-msg_code(rpbgetbucketresp)       -> 20;
-msg_code(rpbsetbucketreq)        -> 21;
-msg_code(rpbsetbucketresp)       -> 22;
-msg_code(rpbmapredreq)           -> 23;
-msg_code(rpbmapredresp)          -> 24;
-msg_code(rpbindexreq)            -> 25;
-msg_code(rpbindexresp)           -> 26;
-msg_code(rpbsearchqueryreq)      -> 27;
-msg_code(rpbsearchqueryresp)     -> 28;
-msg_code(rpbresetbucketreq)      -> 29;
-msg_code(rpbresetbucketresp)     -> 30;
-msg_code(rpbcsbucketreq)         -> 40;
-msg_code(rpbcsbucketresp)        -> 41;
-msg_code(rpbcounterupdatereq)    -> 50;
-msg_code(rpbcounterupdateresp)   -> 51;
-msg_code(rpbcountergetreq)       -> 52;
-msg_code(rpbcountergetresp)      -> 53.
+msg_code(Atom) -> riak_pb_messages:msg_code(Atom).
 
 %% @doc Selects the appropriate PB decoder for a message code.
 -spec decoder_for(pos_integer()) -> module().
-decoder_for(N) when N >= 0, N < 3;
-                    N == 7; N == 8;
-                    N == 29; N == 30 ->
-    riak_pb;
-decoder_for(N) when N >= 3, N < 7;
-                    N >= 9, N =< 26;
-                    N == 40;
-                    N == 41;
-                    N >= 50, N =< 53 ->
-    riak_kv_pb;
-decoder_for(N) when N >= 27, N =< 28 ->
-    riak_search_pb.
+decoder_for(N) -> riak_pb_messages:decoder_for(N).
 
 %% @doc Selects the appropriate PB encoder for a given message name.
 -spec encoder_for(atom()) -> module().
@@ -234,7 +157,7 @@ encode_pair({K,V}) ->
     #rpbpair{key = to_binary(K), value = to_binary(V)}.
 
 %% @doc Convert RpbPair PB message to erlang {K,V} tuple
--spec decode_pair(#rpbpair{}) -> {string(), string()}.
+-spec decode_pair(#rpbpair{}) -> {binary(), binary()}.
 decode_pair(#rpbpair{key = K, value = V}) ->
     {K, V}.
 
@@ -262,8 +185,11 @@ decode_bucket_props(#rpbbucketprops{n_val=N,
                                     notfound_ok=NFOK,
                                     backend=Backend,
                                     search=Search,
-                                    repl=Repl
-
+                                    repl=Repl,
+                                    search_index=Index,
+                                    datatype=Datatype,
+                                    consistent=Consistent,
+                                    write_once=WriteOnce
                                    }) ->
     %% Extract numerical properties
     [ {P,V} || {P,V} <- [ {n_val, N}, {old_vclock, Old}, {young_vclock, Young},
@@ -273,7 +199,8 @@ decode_bucket_props(#rpbbucketprops{n_val=N,
     [ {BProp, decode_bool(Bool)} ||
        {BProp, Bool} <- [{allow_mult, AM}, {last_write_wins, LWW},
                          {basic_quorum, BQ}, {notfound_ok, NFOK},
-                         {search, Search}],
+                         {search, Search}, {consistent, Consistent},
+                         {write_once, WriteOnce}],
         Bool /= undefined ] ++
 
     %% Extract commit hooks
@@ -286,8 +213,9 @@ decode_bucket_props(#rpbbucketprops{n_val=N,
                                                               {linkfun, Link}],
                                              MF /= undefined ] ++
 
-    %% Extract backend
-    [ {backend, Backend} || is_binary(Backend) ] ++
+    %% Extract backend and Yokozuna index
+    [ {P,V}  || {P,V} <- [{backend, Backend}, {search_index, Index}],
+                is_binary(V) ] ++
 
     %% Extract quora
     [ {QProp, riak_pb_kv_codec:decode_quorum(Q)} ||
@@ -295,7 +223,11 @@ decode_bucket_props(#rpbbucketprops{n_val=N,
         Q /= undefined ] ++
 
     %% Extract repl prop
-    [ {repl, decode_repl(Repl)} || Repl /= undefined ].
+    [ {repl, decode_repl(Repl)} || Repl /= undefined ] ++
+
+    %% Extract datatype prop
+    [ {datatype, safe_to_atom(Datatype)} || is_binary(Datatype) ].
+
 
 
 %% @doc Convert a property list to an RpbBucketProps message
@@ -354,6 +286,14 @@ encode_bucket_props([{search, S}|Rest], Pb) ->
     encode_bucket_props(Rest, Pb#rpbbucketprops{search = encode_bool(S)});
 encode_bucket_props([{repl, Atom}|Rest], Pb) ->
     encode_bucket_props(Rest, Pb#rpbbucketprops{repl = encode_repl(Atom)});
+encode_bucket_props([{search_index, B}|Rest], Pb) ->
+    encode_bucket_props(Rest, Pb#rpbbucketprops{search_index = to_binary(B)});
+encode_bucket_props([{datatype, D}|Rest], Pb) ->
+    encode_bucket_props(Rest, Pb#rpbbucketprops{datatype = to_binary(D)});
+encode_bucket_props([{consistent, S}|Rest], Pb) ->
+    encode_bucket_props(Rest, Pb#rpbbucketprops{consistent = encode_bool(S)});
+encode_bucket_props([{write_once, S}|Rest], Pb) ->
+    encode_bucket_props(Rest, Pb#rpbbucketprops{write_once = encode_bool(S)});
 encode_bucket_props([_Ignore|Rest], Pb) ->
     %% Ignore any properties not explicitly part of the PB message
     encode_bucket_props(Rest, Pb).
@@ -427,3 +367,12 @@ decode_repl('TRUE') -> true;
 decode_repl('FALSE') -> false;
 decode_repl('REALTIME') -> realtime;
 decode_repl('FULLSYNC') -> fullsync.
+
+safe_to_atom(Binary) when is_binary(Binary) ->
+    try
+        binary_to_existing_atom(Binary, latin1)
+    catch
+        error:badarg ->
+            error_logger:warning_msg("Creating new atom from protobuffs message! ~p", [Binary]),
+            binary_to_atom(Binary, latin1)
+    end.

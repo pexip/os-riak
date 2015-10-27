@@ -1,0 +1,7 @@
+deps
+*.beam
+ebin/*.app
+setup_gen
+xtest/releases
+xtest/testapp-*/ebin
+setup.plt

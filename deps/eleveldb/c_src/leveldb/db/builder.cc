@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+
 #include "db/builder.h"
 
 #include "db/filename.h"
@@ -23,22 +26,34 @@ Status BuildTable(const std::string& dbname,
                   FileMetaData* meta,
                   SequenceNumber smallest_snapshot) {
   Status s;
+  size_t keys_seen, keys_retired;
+
+  keys_seen=0;
+  keys_retired=0;
+
   meta->file_size = 0;
   iter->SeekToFirst();
 
   KeyRetirement retire(user_comparator, smallest_snapshot);
 
-  std::string fname = TableFileName(dbname, meta->number, meta->level);
+  std::string fname = TableFileName(options, meta->number, meta->level);
   if (iter->Valid()) {
     WritableFile* file;
-    s = env->NewWritableFile(fname, &file);
+
+    s = env->NewWritableFile(fname, &file,
+                                 env->RecoveryMmapSize(&options));
     if (!s.ok()) {
       return s;
     }
 
+    // tune fadvise to keep all of this lower level file in page cache
+    //  (compaction of unsorted files causes severe cache misses)
+    file->SetMetadataOffset(1);
+
     TableBuilder* builder = new TableBuilder(options, file);
     meta->smallest.DecodeFrom(iter->key());
     for (; iter->Valid(); iter->Next()) {
+      ++keys_seen;
       Slice key = iter->key();
       if (!retire(key))
       {
@@ -46,6 +61,10 @@ Status BuildTable(const std::string& dbname,
           builder->Add(key, iter->value());
           ++meta->num_entries;
       }   // if
+      else
+      {
+          ++keys_retired;
+      }   // else
     }
 
     // Finish and check for builder errors
@@ -88,6 +107,11 @@ Status BuildTable(const std::string& dbname,
 
   if (s.ok() && meta->file_size > 0) {
     // Keep it
+      if (0!=keys_retired)
+      {
+          Log(options.info_log, "Level-0 table #%" PRIu64 ": %zd keys seen, %zd keys retired",
+              meta->number, keys_seen, keys_retired);
+      }   // if
   } else {
     env->DeleteFile(fname);
   }

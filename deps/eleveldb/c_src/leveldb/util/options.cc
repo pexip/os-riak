@@ -2,12 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+
 #include "leveldb/options.h"
 
 #include "leveldb/comparator.h"
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
+#include "util/cache2.h"
 #include "util/crc32c.h"
+
 
 namespace leveldb {
 
@@ -23,12 +28,19 @@ Options::Options()
       max_open_files(1000),
       block_cache(NULL),
       block_size(4096),
+      block_size_steps(16),
       block_restart_interval(16),
       compression(kSnappyCompression),
       filter_policy(NULL),
       is_repair(false),
       is_internal_db(false),
-      fadvise_willneed(false)
+      total_leveldb_mem(0),
+      block_cache_threshold(32<<20),
+      limited_developer_mem(false),
+      mmap_size(0),
+      delete_threshold(1000),
+      fadvise_willneed(false),
+      tiered_slow_level(0)
 {
 }
 
@@ -48,12 +60,21 @@ Options::Dump(
     Log(log,"        Options.max_open_files: %d", max_open_files);
     Log(log,"           Options.block_cache: %p", block_cache);
     Log(log,"            Options.block_size: %zd", block_size);
+    Log(log,"      Options.block_size_steps: %d", block_size_steps);
     Log(log,"Options.block_restart_interval: %d", block_restart_interval);
     Log(log,"           Options.compression: %d", compression);
     Log(log,"         Options.filter_policy: %s", filter_policy == NULL ? "NULL" : filter_policy->Name());
     Log(log,"             Options.is_repair: %s", is_repair ? "true" : "false");
     Log(log,"        Options.is_internal_db: %s", is_internal_db ? "true" : "false");
+    Log(log,"     Options.total_leveldb_mem: %" PRIu64, total_leveldb_mem);
+    Log(log," Options.block_cache_threshold: %" PRIu64, block_cache_threshold);
+    Log(log," Options.limited_developer_mem: %s", limited_developer_mem ? "true" : "false");
+    Log(log,"             Options.mmap_size: %" PRIu64, mmap_size);
+    Log(log,"      Options.delete_threshold: %" PRIu64, delete_threshold);
     Log(log,"      Options.fadvise_willneed: %s", fadvise_willneed ? "true" : "false");
+    Log(log,"     Options.tiered_slow_level: %d", tiered_slow_level);
+    Log(log,"    Options.tiered_fast_prefix: %s", tiered_fast_prefix.c_str());
+    Log(log,"    Options.tiered_slow_prefix: %s", tiered_slow_prefix.c_str());
     Log(log,"                        crc32c: %s", crc32c::IsHardwareCRC() ? "hardware" : "software");
 }   // Options::Dump
 

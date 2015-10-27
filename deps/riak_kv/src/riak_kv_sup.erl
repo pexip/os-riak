@@ -44,6 +44,7 @@ init([]) ->
     catch dtrace:init(),                   % NIF load trigger (R14B04)
     catch dyntrace:p(),                    % NIF load trigger (R15B01+)
     riak_kv_entropy_info:create_table(),
+    riak_kv_hooks:create_table(),
     VMaster = {riak_kv_vnode_master,
                {riak_core_vnode_master, start_link,
                 [riak_kv_vnode, riak_kv_legacy_vnode, riak_kv]},
@@ -60,6 +61,9 @@ init([]) ->
                   {riak_kv_js_manager, start_link,
                   [?JSPOOL_HOOK, read_js_pool_size(hook_js_vm_count, "hook callback")]},
                   permanent, 30000, worker, [riak_kv_js_manager]},
+    HTTPCache = {riak_kv_http_cache,
+		 {riak_kv_http_cache, start_link, []},
+		 permanent, 5000, worker, [riak_kv_http_cache]},
     JSSup = {riak_kv_js_sup,
              {riak_kv_js_sup, start_link, []},
              permanent, infinity, supervisor, [riak_kv_js_sup]},
@@ -69,6 +73,9 @@ init([]) ->
     PutFsmSup = {riak_kv_put_fsm_sup,
                  {riak_kv_put_fsm_sup, start_link, []},
                  permanent, infinity, supervisor, [riak_kv_put_fsm_sup]},
+    FastPutSup = {riak_kv_w1c_sup,
+                 {riak_kv_w1c_sup, start_link, []},
+                 permanent, infinity, supervisor, [riak_kv_w1c_sup]},
     DeleteSup = {riak_kv_delete_sup,
                  {riak_kv_delete_sup, start_link, []},
                  permanent, infinity, supervisor, [riak_kv_delete_sup]},
@@ -88,6 +95,10 @@ init([]) ->
                       {riak_kv_entropy_manager, start_link, []},
                       permanent, 30000, worker, [riak_kv_entropy_manager]},
 
+    EnsemblesKV =  {riak_kv_ensembles,
+                    {riak_kv_ensembles, start_link, []},
+                    permanent, 30000, worker, [riak_kv_ensembles]},
+
     % Figure out which processes we should run...
     HasStorageBackend = (app_helper:get_env(riak_kv, storage_backend) /= undefined),
 
@@ -96,16 +107,19 @@ init([]) ->
         ?IF(HasStorageBackend, VMaster, []),
         GetFsmSup,
         PutFsmSup,
+        FastPutSup,
         DeleteSup,
         SinkFsmSup,
         BucketsFsmSup,
         KeysFsmSup,
         IndexFsmSup,
         EntropyManager,
+        [EnsemblesKV || riak_core_sup:ensembles_enabled()],
         JSSup,
         MapJSPool,
         ReduceJSPool,
-        HookJSPool
+        HookJSPool,
+        HTTPCache
     ]),
 
     % Run the proesses...

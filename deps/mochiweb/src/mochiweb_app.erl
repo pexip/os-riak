@@ -22,6 +22,6 @@ stop(_State) ->
 %%
 %% Tests
 %%
--ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-ifdef(TEST).
 -endif.

@@ -165,31 +165,32 @@ start_lager() ->
     end.
 
 load_app_config() ->
-    case filelib:is_dir(etc_dir()) of
-        false ->
-            {error, "Cannot find Riak configuration directory!"};
-        true ->
-            AppConfig = filename:join([etc_dir(), "app.config"]),
-            case file:consult(AppConfig) of
-                {ok, [Config]} ->
-                    application:set_env(riaknostic, app_config, Config);
-                _ ->
-                    {error, io_lib:format("Riak config file ~s is malformed!", [AppConfig])}
-            end
+    {ok, [[AppConfig]]} = init:get_argument(config),
+    case file:consult(AppConfig) of
+        {ok, [Config]} ->
+            application:set_env(riaknostic, app_config, Config);
+        _ ->
+            {error, io_lib:format("Riak config file ~s is malformed!", [AppConfig])}
     end.
 
 load_vm_args() ->
-    case filelib:is_dir(etc_dir()) of
-        false ->
-            {error, "Cannot find Riak configuration directory!"};
-        true ->
-            VmArgs = filename:join([etc_dir(), "vm.args"]),
-            case file:read_file(VmArgs) of
-                {error, Reason} ->
-                    {error, io_lib:format("Could not read ~s, received error ~w!", [VmArgs, Reason])};
-                {ok, Binary} ->
-                    load_vm_args(Binary)
-            end
+    VmArgs = case init:get_argument(vm_args) of 
+        {ok, [[X]]} -> X;
+        _ ->
+            %% This is a backup. If for some reason -vm_args isn't specified
+            %% then assume it lives in the same dir as app.config
+            {ok, [[AppConfig]]} = init:get_argument(config),
+            AppIndex = string:str(AppConfig, "app"),
+            ConfigIndex = string:rstr(AppConfig, "config"),
+            string:sub_string(AppConfig, 1, AppIndex - 1) ++ "vm" ++
+                string:sub_string(AppConfig, AppIndex + 3, ConfigIndex-1) ++ "args"
+    end,
+
+    case file:read_file(VmArgs) of
+        {error, Reason} ->
+            {error, io_lib:format("Could not read ~s, received error ~w!", [VmArgs, Reason])};
+        {ok, Binary} ->
+            load_vm_args(Binary)
     end.
 
 load_vm_args(Bin) when is_binary(Bin) ->

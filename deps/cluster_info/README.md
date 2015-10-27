@@ -42,33 +42,27 @@ Configuring maximum string length formatting limits
 It's a well-known feature of Erlang that the default string
 representation is a list of byte values.  Strings can consume much
 more RAM than if the equivalent data were stored in the Erlang binary
-data type instead.  If a prerequisite OTP application, `riak_err`, is
+data type instead.  If a prerequisite OTP application, `lager`, is
 available, then this application can use the
-`riak_err_handler:limited_fmt/4` function to attempt to limit the
+`lager_format:format/4` function to attempt to limit the
 amount of memory used while generating reports.
 
 To limit the amount of RAM used to format strings in a report, this
 application will attempt to fetch the following OTP application
-environment variables from either the `riak_err` app's variables or
-the `cluster_info` app's variables:
+environment variable from the `cluster_info` app's variables:
 
-* `term_max_size` Report output is formatted via
-`cluster_info:format(FormatString, ArgList)` calls.
-If the total size of ArgList is more than `term_max_size`,
-then we'll ignore `FormatString` and log the message with a well-known
-(and therefore safe) formatting string instead.
 * `fmt_max_bytes` When formatting a log-related term that might
 be "big", limit the term's formatted output to a maximum of
-`fmt_max_bytes` bytes.  
+`fmt_max_bytes` bytes.
 
-The default for both values is 256KB.
+The default value is 256KB.
 
 You have several options for configuring these OTP application
 environment variables:
 
 * Add the following to your packaging's system configuration file
   (which is specified by the `-config /path/to/file` flag to the
-  runtime system ... see the 
+  runtime system ... see the
   [online docs for configuration OTP applications, "7.8  Configuring an Application"](http://www.erlang.org/doc/design_principles/applications.html#id71589)
   for more details:
 
@@ -86,15 +80,8 @@ environment variables:
     `application:set_env(cluster_info, term_max_size, 65536),
     application:set_env(cluster_info, fmt_max_bytes, 65536)`
 
-If the `term_max_size` environment variable is not defined (by neither
-the `riak_err` application nor the `cluster_info` application), then
+If the `fmt_max_bytes` environment variable is not defined, then
 the length of formatted strings will not be restricted.
-
-If the `term_max_size` environment variable is defined but the BEAM
-object file `riak_err_handler` is not available, then attempts to
-generate a report will throw undefined function exceptions.  As noted
-at the top of this section, the `riak_err` application must be
-compiled and packaged together with the `cluster_info` application.
 
 Licensing
 ---------

@@ -41,9 +41,12 @@ acquire(Type, Dirname) ->
     case bitcask_nifs:lock_acquire(LockFilename, 1) of
         {ok, Lock} ->
             %% Successfully acquired our lock. Update the file with our PID.
-            ok = bitcask_nifs:lock_writedata(Lock, iolist_to_binary([os:getpid(), " \n"])),
-            {ok, Lock};
-
+            case bitcask_nifs:lock_writedata(Lock, iolist_to_binary([os:getpid(), " \n"])) of
+                ok ->
+                    {ok, Lock};
+                {error, _} = Else ->
+                    Else
+            end;
         {error, eexist} ->
             %% Lock file already exists, but may be stale. Delete it if it's stale
             %% and try to acquire again
@@ -137,7 +140,7 @@ delete_stale_lock(Filename) ->
                                 not_stale;
                             false ->
                                 %% The lock IS stale; delete the file.
-                                file:delete(Filename),
+                                _ = file:delete(Filename),
                                 ok
                         end;
 

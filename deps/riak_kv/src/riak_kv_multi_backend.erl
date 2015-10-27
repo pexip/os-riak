@@ -20,6 +20,37 @@
 %%
 %% -------------------------------------------------------------------
 
+%% @doc riak_kv_multi_backend allows you to run multiple backends within a
+%% single Riak instance. The 'backend' property of a bucket specifies
+%% the backend in which the object should be stored. If no 'backend'
+%% is specified, then the 'multi_backend_default' setting is used.
+%% If this is unset, then the first defined backend is used.
+%%
+%% === Configuration ===
+%%
+%% ```
+%%     {storage_backend, riak_kv_multi_backend},
+%%     {multi_backend_default, first_backend},
+%%     {multi_backend, [
+%%       % format: {name, module, [Configs]}
+%%       {first_backend, riak_xxx_backend, [
+%%         {config1, ConfigValue1},
+%%         {config2, ConfigValue2}
+%%       ]},
+%%       {second_backend, riak_yyy_backend, [
+%%         {config1, ConfigValue1},
+%%         {config2, ConfigValue2}
+%%       ]}
+%%     ]}
+%% '''
+%%
+%% Then, tell a bucket which one to use...
+%%
+%% ```
+%%     riak_core_bucket:set_bucket(<<"MY_BUCKET">>, [{backend, second_backend}])
+%% '''
+%%
+
 -module (riak_kv_multi_backend).
 -behavior(riak_kv_backend).
 
@@ -52,42 +83,13 @@
 
 -define(API_VERSION, 1).
 -define(CAPABILITIES, [async_fold, index_reformat]).
--define(ANY_CAPABILITIES, [indexes]).
+-define(ANY_CAPABILITIES, [indexes, iterator_refresh]).
 
--record (state, {backends :: [{atom(), atom(), term()}],
+-record (state, {backends :: [{atom(), atom(), term()}], % [{BackendName, BackendModule, SubState}]
                  default_backend :: atom()}).
 
 -type state() :: #state{}.
 -type config() :: [{atom(), term()}].
-
-%% @doc riak_kv_multi_backend allows you to run multiple backends within a
-%% single Riak instance. The 'backend' property of a bucket specifies
-%% the backend in which the object should be stored. If no 'backend'
-%% is specified, then the 'multi_backend_default' setting is used.
-%% If this is unset, then the first defined backend is used.
-%%
-%% === Configuration ===
-%%
-%%     {storage_backend, riak_kv_multi_backend},
-%%     {multi_backend_default, first_backend},
-%%     {multi_backend, [
-%%       % format: {name, module, [Configs]}
-%%       {first_backend, riak_xxx_backend, [
-%%         {config1, ConfigValue1},
-%%         {config2, ConfigValue2}
-%%       ]},
-%%       {second_backend, riak_yyy_backend, [
-%%         {config1, ConfigValue1},
-%%         {config2, ConfigValue2}
-%%       ]}
-%%     ]}
-%%
-%%
-%% Then, tell a bucket which one to use...
-%%
-%%     riak_core_bucket:set_bucket(&lt;&lt;"MY_BUCKET"&gt;&gt;, [{backend, second_backend}])
-%%
-%%
 
 %% ===================================================================
 %% Public API
@@ -205,7 +207,7 @@ start_backend(Name, Module, Partition, Config) ->
 %% @doc Stop the backends
 -spec stop(state()) -> ok.
 stop(#state{backends=Backends}) ->
-    [Module:stop(SubState) || {_, Module, SubState} <- Backends],
+    _ = [Module:stop(SubState) || {_, Module, SubState} <- Backends],
     ok.
 
 %% @doc Retrieve an object from the backend
@@ -263,12 +265,12 @@ delete(Bucket, Key, IndexSpecs, State) ->
                    state()) -> {ok, any()} | {async, fun()} | {error, term()}.
 fold_buckets(FoldBucketsFun, Acc, Opts, State) ->
     fold_all(fold_buckets, FoldBucketsFun, Acc, Opts, State,
-             fun default_backend_filter/4).
+             fun default_backend_filter/5).
 
 %% @doc Fold only over index data in the backend, for all buckets.
 fold_indexes(FoldIndexFun, Acc, Opts, State) ->
     fold_all(fold_indexes, FoldIndexFun, Acc, Opts, State,
-            fun indexes_filter/4).
+            fun indexes_filter/5).
 
 %% @doc Fold over all the keys for one or all buckets.
 -spec fold_keys(riak_kv_backend:fold_keys_fun(),
@@ -279,7 +281,7 @@ fold_keys(FoldKeysFun, Acc, Opts, State) ->
     case proplists:get_value(bucket, Opts) of
         undefined ->
             fold_all(fold_keys, FoldKeysFun, Acc, Opts, State,
-                    fun default_backend_filter/4);
+                    fun default_backend_filter/5);
         Bucket ->
             fold_in_bucket(Bucket, fold_keys, FoldKeysFun, Acc, Opts, State)
     end.
@@ -293,7 +295,7 @@ fold_objects(FoldObjectsFun, Acc, Opts, State) ->
     case proplists:get_value(bucket, Opts) of
         undefined ->
             fold_all(fold_objects, FoldObjectsFun, Acc, Opts, State,
-                    fun default_backend_filter/4);
+                    fun default_backend_filter/5);
         Bucket ->
             fold_in_bucket(Bucket, fold_objects, FoldObjectsFun, Acc, Opts, State)
     end.
@@ -351,7 +353,7 @@ status(#state{backends=Backends}) ->
 callback(Ref, Msg, #state{backends=Backends}=State) ->
     %% Pass the callback on to all submodules - their responsbility to
     %% filter out if they need it.
-    [Mod:callback(Ref, Msg, ModState) || {_N, Mod, ModState} <- Backends],
+    _ = [Mod:callback(Ref, Msg, ModState) || {_N, Mod, ModState} <- Backends],
     {ok, State}.
 
 set_legacy_indexes(State=#state{backends=Backends}, WriteLegacy) ->
@@ -510,9 +512,13 @@ fold_in_bucket(Bucket, ModFun, FoldFun, Acc, Opts, State) ->
                   Opts,
                   SubState).
 
+default_backend_filter(Opts, Name, _Module, _SubState, ModCaps) ->
+    filter_on_backend_opts(Opts, Name) andalso
+        filter_on_index_reformat(Opts, ModCaps).
+
 %% @doc Skips folding if index reformat operation on
 %% non-index reformat capable backend.
-default_backend_filter(Opts, _Module, _SubState, ModCaps) ->
+filter_on_index_reformat(Opts, ModCaps) ->
     Indexes = lists:keyfind(index, 1, Opts),
     CanReformatIndex = lists:member(index_reformat, ModCaps),
     case {Indexes, CanReformatIndex} of
@@ -522,18 +528,28 @@ default_backend_filter(Opts, _Module, _SubState, ModCaps) ->
             true
     end.
 
+%% @doc If a {backend, [BACKEND_LIST]} option is specified,
+%% don't fold over any backends that aren't in the list.
+filter_on_backend_opts(Opts, Name) ->
+    case lists:keyfind(backend, 1, Opts) of
+        false ->
+            true; % If no {backend, [...]} option is set, don't filter anything here
+        {backend, BackendList} ->
+            lists:member(Name, BackendList)
+    end.
+
 %% @doc Skips folding on backends that do not support indexes.
-indexes_filter(_Opts, _Module, _SubState, ModCaps) ->
+indexes_filter(_Opts, _Name, _Module, _SubState, ModCaps) ->
     lists:member(indexes, ModCaps).
 
 %% @private
 backend_fold_fun(ModFun, FoldFun, Opts, AsyncFold, BackendFilter) ->
-    fun({_, Module, SubState}, {Acc, WorkList}) ->
+    fun({Name, Module, SubState}, {Acc, WorkList}) ->
             %% Get the backend capabilities to determine
             %% if it supports asynchronous folding.
             {ok, ModCaps} = Module:capabilities(SubState),
             DoAsync = AsyncFold andalso lists:member(async_fold, ModCaps),
-            case BackendFilter(Opts, Module, SubState, ModCaps) of
+            case BackendFilter(Opts, Name, Module, SubState, ModCaps) of
                 false ->
                     {Acc, WorkList};
                 true ->
@@ -598,7 +614,6 @@ backend_can_index_reformat(Mod, ModState) ->
 %% ===================================================================
 -ifdef(TEST).
 
-%% @private
 multi_backend_test_() ->
     {foreach,
      fun() ->
@@ -660,6 +675,36 @@ multi_backend_test_() ->
               }
       end,
       fun(_) ->
+              {"fold_buckets test",
+               fun() ->
+                       B1 = <<"b1">>, B2 = <<"b2">>,
+                       K1 = <<"k1">>, K2 = <<"k2">>,
+                       V1 = <<"v1">>, V2 = <<"v2">>,
+
+                       riak_core_bucket:set_bucket(B1, [{backend, first_backend}]),
+                       riak_core_bucket:set_bucket(B2, [{backend, second_backend}]),
+
+                       %% Start the backend...
+                       {ok, State} = start(42, sample_config()),
+
+                       %% Create some placeholder values in the buckets so that they show
+                       %% up when we run the fold operation...
+                       put(B1, K1, [], V1, State),
+                       put(B2, K2, [], V2, State),
+
+                       %% First do a basic fold with no options to make sure we iterate
+                       %% correctly over all buckets:
+                       FoldFun = fun(Bucket, Acc) -> [Bucket | Acc] end,
+                       {ok, FoldRes} = fold_buckets(FoldFun, [], [], State),
+                       [B1, B2] = lists:sort(FoldRes),
+
+                       %% Then filter on a specific backend, and we should only see
+                       %% the bucket using that backend:
+                       {ok, [B2]} = fold_buckets(FoldFun, [], [{backend, [second_backend]}], State)
+               end
+              }
+      end,
+      fun(_) ->
               {"start error with invalid backend test",
                fun() ->
                        %% Attempt to start the backend with a
@@ -674,7 +719,6 @@ multi_backend_test_() ->
 
 -ifdef(EQC).
 
-%% @private
 eqc_test_() ->
     {spawn,
      [{inorder,

@@ -3,9 +3,7 @@ minispade.register('app', function() {
   /**
    * RiakControl Ember application.
    */
-  RiakControl = Ember.Application.create({
-    ready: Ember.alias('initialize')
-  });
+  RiakControl = Ember.Application.create();
 
   /**
    * How often to refresh/poll the server for changes in cluster
@@ -13,37 +11,30 @@ minispade.register('app', function() {
    */
   RiakControl.refreshInterval = 1000;
 
-  RiakControl.ApplicationController = Ember.Controller.extend();
-
-  RiakControl.ApplicationView = Ember.View.extend({
-    templateName: 'application'
-  });
-
-  DS.Model.reopen({
-    reload: function() {
-        var store = this.get('store');
-        store.get('adapter').find(store, this.constructor, this.get('id'));
-      }
-  });
-
+  /**
+   * Provide reload functionality for recordarrays.
+   */
   DS.RecordArray.reopen({
     reload: function() {
-        Ember.assert("Can only reload base RecordArrays", this.constructor === DS.RecordArray);
-        var store = this.get('store');
-        store.get('adapter').findAll(store, this.get('type'));
-      }
+      Ember.assert("Can only reload base RecordArrays",
+        this.constructor === DS.RecordArray);
+      var store = this.get('store');
+      store.findAll(this.get('type'));
+    }
   });
 
+  /**
+   * Data store configuration.
+   */
   RiakControl.Store = DS.Store.extend({
-    revision: 4,
-    adapter: DS.RESTAdapter.create({ namespace: 'admin' })
+    adapter: DS.RESTAdapter.reopen({ namespace: 'admin' })
   });
 
   RiakControl.store = RiakControl.Store.create();
 
   // Automatically add CSRF tokens to AJAX requests.
-  $("body").bind("ajaxSend", function(elm, xhr, s){
-    var csrf_token = $('meta[name=csrf_token]').attr('content');
+  $(document).ajaxSend(function(elm, xhr, s){
+    var csrf_token = $('meta[name=csrf_token]').prop('content');
 
     if(s.type === 'POST' || s.type === 'PUT') {
       xhr.setRequestHeader('X-CSRF-Token', csrf_token);

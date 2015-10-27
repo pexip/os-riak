@@ -2,7 +2,7 @@
 %%
 %% riak_kv_eleveldb_backend: Backend Driver for LevelDB
 %%
-%% Copyright (c) 2007-2011 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2007-2014 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -31,6 +31,7 @@
          stop/1,
          get/3,
          put/5,
+         async_put/5,
          delete/4,
          drop/1,
          fix_index/3,
@@ -59,10 +60,11 @@
 -endif.
 
 -define(API_VERSION, 1).
--define(CAPABILITIES, [async_fold, indexes, index_reformat, size]).
+-define(CAPABILITIES, [async_fold, indexes, index_reformat, size,
+        iterator_refresh]).
 -define(FIXED_INDEXES_KEY, fixed_indexes).
 
--record(state, {ref :: reference(),
+-record(state, {ref :: eleveldb:db_ref(),
                 data_root :: string(),
                 open_opts = [],
                 config :: config(),
@@ -201,6 +203,11 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, #state{ref=Ref,
         {error, Reason} ->
             {error, Reason, State}
     end.
+
+async_put(Context, Bucket, PrimaryKey, Val, #state{ref=Ref, write_opts=WriteOpts}=State) ->
+    StorageKey = to_object_key(Bucket, PrimaryKey),
+    eleveldb:async_put(Ref, Context, StorageKey, Val, WriteOpts),
+    {ok, State}.
 
 indexes_fixed(#state{ref=Ref,read_opts=ReadOpts}) ->
     case eleveldb:get(Ref, to_md_key(?FIXED_INDEXES_KEY), ReadOpts) of
@@ -466,9 +473,15 @@ fold_objects(FoldObjectsFun, Acc, Opts, #state{fold_opts=FoldOpts,
            true            -> undefined
         end,
 
+    IteratorRefresh =
+        case lists:keyfind(iterator_refresh, 1, Opts) of
+            false -> [];
+            Tuple -> [Tuple]
+        end,
+
     %% Set up the fold...
     FirstKey = to_first_key(Limiter),
-    FoldOpts1 = [{first_key, FirstKey} | FoldOpts],
+    FoldOpts1 = IteratorRefresh ++ [{first_key, FirstKey} | FoldOpts],
     FoldFun = fold_objects_fun(FoldObjectsFun, Limiter),
 
     ObjectFolder =
@@ -787,9 +800,7 @@ fold_keys_fun(FoldKeysFun, {index, incorrect_format, ForUpgrade}) when is_boolea
 fold_keys_fun(FoldKeysFun, {index, Bucket, V1Q}) ->
     %% Handle legacy queries
     Q = riak_index:upgrade_query(V1Q),
-    fold_keys_fun(FoldKeysFun, {index, Bucket, Q});
-fold_keys_fun(_FoldKeysFun, Other) ->
-    throw({unknown_limiter, Other}).
+    fold_keys_fun(FoldKeysFun, {index, Bucket, Q}).
 
 %% @private
 %% To stop a fold in progress when pagination limit is reached.
@@ -847,7 +858,7 @@ fold_objects_fun(FoldObjectsFun, undefined) ->
 %% bucket "foo" would be `sext:encode({o, <<"foo">>, <<>>}).`
 to_first_key(undefined) ->
     %% Start at the first object in LevelDB...
-    to_object_key(<<>>, <<>>);
+    to_object_key({<<>>, <<>>}, <<>>);
 to_first_key({bucket, Bucket}) ->
     %% Start at the first object for a given bucket...
     to_object_key(Bucket, <<>>);
@@ -930,7 +941,10 @@ custom_config_test_() ->
     application:set_env(eleveldb, data_root, ""),
     riak_kv_backend:standard_test(?MODULE, [{data_root, "test/eleveldb-backend"}]).
 
-retry_test() ->
+retry_test_() ->
+    {spawn, [fun retry/0, fun retry_fail/0]}.
+
+retry() ->
     Root = "/tmp/eleveldb_retry_test",
     try
         {ok, State1} = start(42, [{data_root, Root}]),
@@ -981,7 +995,7 @@ retry_test() ->
         os:cmd("rm -rf " ++ Root)
     end.
 
-retry_fail_test() ->
+retry_fail() ->
     Root = "/tmp/eleveldb_fail_retry_test",
     try
         application:set_env(riak_kv, eleveldb_open_retries, 3), % 3 times, 1ms a time
@@ -1033,7 +1047,7 @@ eqc_test_() ->
          fun setup/0,
          fun cleanup/1,
          [
-          {timeout, 60000,
+          {timeout, 180,
             [?_assertEqual(true,
                           backend_eqc:test(?MODULE, false,
                                            [{data_root,

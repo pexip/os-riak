@@ -31,7 +31,7 @@
 %% should be a function expecting two arguments: `Inputs :: list()'
 %% and `Arg'.  The fun should return a list as its result.  The
 %% function {@link reduce_compat/1} should be used to transform the
-%% usual MapReduce phase spec (`{modfun, ...}', '{jsanon, ...}', etc.)
+%% usual MapReduce phase spec (`{modfun, ...}', `{jsanon, ...}', etc.)
 %% into the variety of function expected here.
 %%
 %% The default behavior is to apply the reduce function to the first
@@ -120,6 +120,7 @@
                 p :: riak_pipe_vnode:partition(),
                 fd :: riak_pipe_fitting:details()}).
 -opaque state() :: #state{}.
+-export_type([state/0]).
 
 -define(DEFAULT_JS_RESERVE_ATTEMPTS, 10).
 

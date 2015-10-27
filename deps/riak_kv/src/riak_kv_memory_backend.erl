@@ -2,7 +2,7 @@
 %%
 %% riak_memory_backend: storage engine using ETS tables
 %%
-%% Copyright (c) 2007-2011 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2007-2013 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -116,13 +116,19 @@ capabilities(_, _) ->
 %% @doc Start the memory backend
 -spec start(integer(), config()) -> {ok, state()}.
 start(Partition, Config) ->
-    TTL = app_helper:get_prop_or_env(ttl, Config, memory_backend),
-    MemoryMB = app_helper:get_prop_or_env(max_memory, Config, memory_backend),
+    TTL = riak_kv_util:get_backend_config(ttl, Config, memory_backend),
+    MemoryMB = riak_kv_util:get_backend_config(max_memory, Config, memory_backend),
+    %% leave this one alone, it is only for testing
+    NormalTableOpts = [ordered_set],
+    TestTableOpts = app_helper:get_prop_or_env(test_table_opts,
+                                               Config,
+                                               memory_backend,
+                                               [named_table, public]),
     TableOpts = case app_helper:get_prop_or_env(test, Config, memory_backend) of
                     true ->
-                        [ordered_set, public, named_table];
+                        NormalTableOpts ++ TestTableOpts;
                     _ ->
-                        [ordered_set]
+                        NormalTableOpts
                 end,
     case MemoryMB of
         undefined ->
@@ -211,6 +217,13 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, State=#state{data_ref=DataRef,
         _ ->
             {{ts, Now}, Val}
     end,
+    OldSize =
+        case ets:lookup(DataRef, {Bucket, PrimaryKey}) of
+            [] ->
+                0;
+            [OldObject] ->
+                object_size(OldObject)
+        end,
     {ok, Size} = do_put(Bucket, PrimaryKey, Val1, IndexSpecs, DataRef, IndexRef),
     NoMemChange = (MaxMemory =:= undefined) orelse (Val =:= undefined),
     UsedMemory1 =
@@ -227,7 +240,8 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, State=#state{data_ref=DataRef,
                                     0),
             UsedMemory + Size - Freed
     end,
-    {ok, State#state{used_memory=UsedMemory1}}.
+    UsedMemory2 = UsedMemory1 - OldSize,
+    {ok, State#state{used_memory=UsedMemory2}}.
 
 %% @doc Delete an object from the memory backend
 -spec delete(riak_object:bucket(), riak_object:key(), [index_spec()], state()) ->
@@ -236,24 +250,28 @@ delete(Bucket, Key, IndexSpecs, State=#state{data_ref=DataRef,
                                              index_ref=IndexRef,
                                              time_ref=TimeRef,
                                              used_memory=UsedMemory}) ->
-    case TimeRef of
-        undefined ->
-            UsedMemory1 = UsedMemory;
-        _ ->
-            %% Lookup the object so we can delete its
-            %% entry from the time table and account
-            %% for the memory used.
-            [Object] = ets:lookup(DataRef, {Bucket, Key}),
-            case Object of
-                {_, {{ts, Timestamp}, _}} ->
-                    ets:delete(TimeRef, Timestamp),
-                    UsedMemory1 = UsedMemory - object_size(Object);
+    case ets:lookup(DataRef, {Bucket, Key}) of
+        [Object] ->
+            case TimeRef of
+                undefined ->
+                    ok;
                 _ ->
-                    UsedMemory1 = UsedMemory
-            end
+                    %% Lookup the object so we can delete its
+                    %% entry from the time table and account
+                    %% for the memory used.
+                    case Object of
+                        {_, {{ts, Timestamp}, _}} ->
+                            ets:delete(TimeRef, Timestamp);
+                        _ ->
+                            ok
+                    end
+            end,
+            UsedMemory1 = UsedMemory - object_size(Object),
+            update_indexes(Bucket, Key, IndexSpecs, IndexRef),
+            ets:delete(DataRef, {Bucket, Key});
+        [] -> 
+            UsedMemory1 = UsedMemory
     end,
-    update_indexes(Bucket, Key, IndexSpecs, IndexRef),
-    ets:delete(DataRef, {Bucket, Key}),
     {ok, State#state{used_memory=UsedMemory1}}.
 
 %% @doc Fold over all the buckets.
@@ -496,13 +514,13 @@ fold_keys_fun(FoldKeysFun, {index, Bucket, Q}) ->
 %% Return a function to fold over keys on this backend
 fold_objects_fun(FoldObjectsFun, undefined) ->
     fun({{Bucket, Key}, Value}, Acc) ->
-            FoldObjectsFun(Bucket, Key, Value, Acc);
+            FoldObjectsFun(Bucket, Key, strip_timestamp(Value), Acc);
        (_, Acc) ->
             Acc
     end;
 fold_objects_fun(FoldObjectsFun, {bucket, FilterBucket}) ->
     fun({{Bucket, Key}, Value}, Acc) when Bucket == FilterBucket->
-            FoldObjectsFun(Bucket, Key, Value, Acc);
+            FoldObjectsFun(Bucket, Key, strip_timestamp(Value), Acc);
        (_, Acc) ->
             Acc
     end;
@@ -510,8 +528,15 @@ fold_objects_fun(FoldObjectsFun, {bucket, FilterBucket}) ->
 fold_objects_fun(FoldObjectsFun, {index, _Bucket, ?KV_INDEX_Q{filter_field=FF}})
     when FF == <<"$bucket">>; FF == <<"$key">>  ->
     fun({{Bucket, Key}, Value}, Acc) ->
-            FoldObjectsFun(Bucket, {o, Key, Value}, Acc)
+            FoldObjectsFun(Bucket, {o, Key, strip_timestamp(Value)}, Acc)
     end.
+
+%% @private
+%% when folding objects, do not return the timestamp info if TTL is enabled
+strip_timestamp({{ts, _}, Val}) ->
+    Val;
+strip_timestamp(Val) ->
+    Val.
 
 %% @private
 get_folder(FoldFun, Acc, DataRef) ->
@@ -681,7 +706,8 @@ object_size(Object) ->
 -ifdef(TEST).
 
 simple_test_() ->
-    riak_kv_backend:standard_test(?MODULE, []).
+    Config = [{test, true}, {test_table_opts, [public]}],
+    riak_kv_backend:standard_test(?MODULE, Config).
 
 ttl_test_() ->
     Config = [{ttl, 15}],
@@ -706,7 +732,6 @@ ttl_test_() ->
      ?_assertEqual({error, not_found, State}, get(Bucket, Key, State))
     ].
 
-%% @private
 max_memory_test_() ->
     %% Set max size to 1.5kb
     Config = [{max_memory, 1.5 * (1 / 1024)}],

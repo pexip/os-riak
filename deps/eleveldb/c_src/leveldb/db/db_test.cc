@@ -71,7 +71,7 @@ class SpecialEnv : public EnvWrapper {
     count_random_reads_ = false;
   }
 
-  Status NewWritableFile(const std::string& f, WritableFile** r) {
+  Status NewWritableFile(const std::string& f, WritableFile** r, size_t map_size) {
     class SSTableFile : public WritableFile {
      private:
       SpecialEnv* env_;
@@ -105,7 +105,7 @@ class SpecialEnv : public EnvWrapper {
       return Status::IOError("simulated write error");
     }
 
-    Status s = target()->NewWritableFile(f, r);
+    Status s = target()->NewWritableFile(f, r, 2<<20);
     if (s.ok()) {
       if (strstr(f.c_str(), ".sst") != NULL) {
         *r = new SSTableFile(this, *r);
@@ -166,7 +166,7 @@ class DBTest {
 
   DBTest() : option_config_(kDefault),
              env_(new SpecialEnv(Env::Default())) {
-    filter_policy_ = NewBloomFilterPolicy(10);
+    filter_policy_ = NewBloomFilterPolicy2(16);
     dbname_ = test::TmpDir() + "/db_test";
     DestroyDB(dbname_, Options());
     db_ = NULL;
@@ -1005,11 +1005,13 @@ TEST(DBTest, SparseMerge) {
 
   // Compactions should not cause us to create a situation where
   // a file overlaps too much data at the next level.
-  ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(), 20*1048576);
+  // 07/10/14 matthewv - we overlap first two levels.  sparse test not appropriate there,
+  //                     and we set overlaps into 100s of megabytes as "normal"
+//  ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(), 20*1048576);
   dbfull()->TEST_CompactRange(0, NULL, NULL);
-  ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(), 20*1048576);
+//  ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(), 20*1048576);
   dbfull()->TEST_CompactRange(1, NULL, NULL);
-  ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(), 20*1048576);
+//  ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(), 20*1048576);
 }
 
 static bool Between(uint64_t val, uint64_t low, uint64_t high) {
@@ -1551,7 +1553,7 @@ TEST(DBTest, BloomFilter) {
   Options options = CurrentOptions();
   options.env = env_;
   options.block_cache = NewLRUCache(0);  // Prevent cache hits
-  options.filter_policy = NewBloomFilterPolicy(10);
+  options.filter_policy = NewBloomFilterPolicy2(16);
   Reopen(&options);
 
   // Populate multiple layers
@@ -1672,10 +1674,12 @@ TEST(DBTest, MultiThreaded) {
 
     // Start threads
     MTThread thread[kNumThreads];
+    pthread_t tid;
     for (int id = 0; id < kNumThreads; id++) {
       thread[id].state = &mt;
       thread[id].id = id;
-      env_->StartThread(MTThreadBody, &thread[id]);
+      tid=env_->StartThread(MTThreadBody, &thread[id]);
+      pthread_detach(tid);
     }
 
     // Let them run for a while

@@ -18,13 +18,8 @@
 %%
 %% -------------------------------------------------------------------
 %%
-%% @doc
-%%
-%% Responsible for viewing and modifying nodes.
-%%
-%% GET /nodes returns the node list.
-%%
-%% @end
+%% @doc Returns a list of all nodes, and information about their
+%%      membership in the cluster.
 
 -module(riak_control_wm_nodes).
 
@@ -36,7 +31,7 @@
          service_available/2,
          content_types_provided/2]).
 
--include_lib("riak_control/include/riak_control.hrl").
+-include("riak_control.hrl").
 -include_lib("webmachine/include/webmachine.hrl").
 
 %% @doc Return routes this resource should respond to.

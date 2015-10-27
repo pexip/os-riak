@@ -46,8 +46,8 @@ eqc_test_() ->
        fun setup/0,
        fun cleanup/1,
        [%% Run the quickcheck tests
-        {timeout, 60000, % do not trust the docs - timeout is in msec
-         ?_assertEqual(true, eqc:quickcheck(eqc:testing_time(50, ?QC_OUT(prop_basic_get()))))}
+        {timeout, 70,
+         ?_assertEqual(true, eqc:quickcheck(eqc:testing_time(60, ?QC_OUT(prop_basic_get()))))}
        ]
       }
      ]
@@ -57,16 +57,23 @@ setup() ->
     %% Shut logging up - too noisy.
     application:load(sasl),
     application:set_env(sasl, sasl_error_logger, {file, "get_fsm_eqc_sasl.log"}),
+    application:set_env(riak_kv, fsm_trace_enabled, true),
     error_logger:tty(false),
     error_logger:logfile({open, "get_fsm_eqc.log"}),
 
     %% Start up mock servers and dependencies
     fsm_eqc_util:start_mock_servers(),
     fsm_eqc_util:start_fake_rng(?MODULE),
+    meck:new(riak_core_bucket),
+    meck:expect(riak_core_bucket, get_bucket,
+                fun(_Bucket) ->
+                        [dvv_enabled]
+                end),
     ok.
 
 cleanup(_) ->
     fsm_eqc_util:cleanup_mock_servers(),
+    meck:unload(riak_core_bucket),
     ok.
 
 %% Call unused callback functions to clear them in the coverage
@@ -212,11 +219,11 @@ prop_basic_get() ->
         {SoftCap, HardCap, Actual, Roll} = RRAbort,
         application:set_env(riak_kv, read_repair_soft, SoftCap),
         application:set_env(riak_kv, read_repair_max, HardCap),
-        FolsomKey = {riak_kv, node, gets, fsm, active},
+        StatKey = [riak, riak_kv, node, gets, fsm, active],
         % don't really care if the key doesn't exist when we delete it.
-        catch folsom_metrics:delete_metric(FolsomKey),
-        folsom_metrics:new_counter(FolsomKey),
-        folsom_metrics:notify({FolsomKey, {inc, Actual}}),
+        _ = exometer:delete(StatKey),
+        exometer:new(StatKey, counter),
+        exometer:update(StatKey, Actual),
         fsm_eqc_util:set_fake_rng(?MODULE, Roll),
 
         {ok, GetPid} = riak_kv_get_fsm:test_link({raw, ReqId, self()},

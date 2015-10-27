@@ -38,7 +38,20 @@
          repair_2i/1,
          reformat_indexes/1,
          reformat_objects/1,
-         reload_code/1]).
+         reload_code/1,
+         bucket_type_status/1,
+         bucket_type_activate/1,
+         bucket_type_create/1,
+         bucket_type_update/1,
+         bucket_type_reset/1,
+         bucket_type_list/1]).
+
+-export([ensemble_status/1]).
+
+%% Reused by Yokozuna for printing AAE status.
+-export([aae_exchange_status/1,
+         aae_repair_status/1,
+         aae_tree_status/1]).
 
 join([NodeStr]) ->
     join(NodeStr, fun riak_core:join/1,
@@ -162,15 +175,11 @@ down([Node]) ->
 -spec(status([]) -> ok).
 status([]) ->
     try
-        case riak_kv_status:statistics() of
-            [] ->
-                io:format("riak_kv_stat is not enabled.\n", []);
-            Stats ->
-                StatString = format_stats(Stats,
+        Stats = riak_kv_status:statistics(),
+	StatString = format_stats(Stats,
                     ["-------------------------------------------\n",
-                        io_lib:format("1-minute stats for ~p~n",[node()])]),
-                io:format("~s\n", [StatString])
-        end
+		     io_lib:format("1-minute stats for ~p~n",[node()])]),
+	io:format("~s\n", [StatString])
     catch
         Exception:Reason ->
             lager:error("Status failed ~p:~p", [Exception,
@@ -205,7 +214,11 @@ reip([OldNode, NewNode]) ->
         %%
         %% Do *not* convert to use riak_core_ring_manager:ring_trans.
         %%
-        application:load(riak_core),
+        case application:load(riak_core) of
+            %% a process, such as cuttlefish, may have already loaded riak_core
+            {error,{already_loaded,riak_core}} -> ok;
+            ok -> ok
+        end,
         RingStateDir = app_helper:get_env(riak_core, ring_state_dir),
         {ok, RingFile} = riak_core_ring_manager:find_latest_ringfile(),
         BackupFN = filename:join([RingStateDir, filename:basename(RingFile)++".BAK"]),
@@ -213,14 +226,12 @@ reip([OldNode, NewNode]) ->
         io:format("Backed up existing ring file to ~p~n", [BackupFN]),
         Ring = riak_core_ring_manager:read_ringfile(RingFile),
         NewRing = riak_core_ring:rename_node(Ring, OldNode, NewNode),
-        riak_core_ring_manager:do_write_ringfile(NewRing),
+        ok = riak_core_ring_manager:do_write_ringfile(NewRing),
         io:format("New ring file written to ~p~n",
             [element(2, riak_core_ring_manager:find_latest_ringfile())])
     catch
         Exception:Reason ->
-            lager:error("Reip failed ~p:~p", [Exception,
-                    Reason]),
-            io:format("Reip failed, see log for details~n"),
+            io:format("Reip failed ~p:~p", [Exception, Reason]),
             error
     end.
 
@@ -271,7 +282,7 @@ cluster_info([OutFile|Rest]) ->
 reload_code([]) ->
     case app_helper:get_env(riak_kv, add_paths) of
         List when is_list(List) ->
-            [ reload_path(filename:absname(Path)) || Path <- List ],
+            _ = [ reload_path(filename:absname(Path)) || Path <- List ],
             ok;
         _ -> ok
     end.
@@ -285,7 +296,7 @@ reload_file(Filename) ->
     case code:is_loaded(Mod) of
         {file, Filename} ->
             code:soft_purge(Mod),
-            code:load_file(Mod),
+            {module, Mod} = code:load_file(Mod),
             io:format("Reloaded module ~w from ~s.~n", [Mod, Filename]);
         {file, Other} ->
             io:format("CONFLICT: Module ~w originally loaded from ~s, won't reload from ~s.~n", [Mod, Other, Filename]);
@@ -297,15 +308,16 @@ aae_status([]) ->
     ExchangeInfo = riak_kv_entropy_info:compute_exchange_info(),
     aae_exchange_status(ExchangeInfo),
     io:format("~n"),
-    aae_tree_status(),
-    io:format("~n"), 
+    TreeInfo = riak_kv_entropy_info:compute_tree_info(),
+    aae_tree_status(TreeInfo),
+    io:format("~n"),
     aae_repair_status(ExchangeInfo).
 
-aae_exchange_status(ExchangeInfo) -> 
+aae_exchange_status(ExchangeInfo) ->
     io:format("~s~n", [string:centre(" Exchanges ", 79, $=)]),
     io:format("~-49s  ~-12s  ~-12s~n", ["Index", "Last (ago)", "All (ago)"]),
     io:format("~79..-s~n", [""]),
-    [begin
+    _ = [begin
          Now = os:timestamp(),
          LastStr = format_timestamp(Now, LastTS),
          AllStr = format_timestamp(Now, AllTS),
@@ -321,7 +333,7 @@ aae_repair_status(ExchangeInfo) ->
                                       string:centre("Mean", 8),
                                       string:centre("Max", 8)]),
     io:format("~79..-s~n", [""]),
-    [begin
+    _ = [begin
          io:format("~-49b  ~s  ~s  ~s~n", [Index,
                                            string:centre(integer_to_list(Last), 8),
                                            string:centre(integer_to_list(Mean), 8),
@@ -330,12 +342,11 @@ aae_repair_status(ExchangeInfo) ->
      end || {Index, _, _, {Last,_Min,Max,Mean}} <- ExchangeInfo],
     ok.
 
-aae_tree_status() ->
-    TreeInfo = riak_kv_entropy_info:compute_tree_info(),
+aae_tree_status(TreeInfo) ->
     io:format("~s~n", [string:centre(" Entropy Trees ", 79, $=)]),
     io:format("~-49s  Built (ago)~n", ["Index"]),
     io:format("~79..-s~n", [""]),
-    [begin
+    _ = [begin
          Now = os:timestamp(),
          BuiltStr = format_timestamp(Now, BuiltTS),
          io:format("~-49b  ~s~n", [Index, BuiltStr]),
@@ -437,6 +448,170 @@ run_reformat(M, F, A) ->
                         [Err, Reason])
     end.
 
+bucket_type_status([TypeStr]) ->
+    Type = unicode:characters_to_binary(TypeStr, utf8, utf8),
+    Return = bucket_type_print_status(Type, riak_core_bucket_type:status(Type)),
+    bucket_type_print_props(bucket_type_raw_props(Type)),
+    Return.
+
+
+bucket_type_raw_props(<<"default">>) ->
+    riak_core_bucket_props:defaults();
+bucket_type_raw_props(Type) ->
+    riak_core_claimant:get_bucket_type(Type, undefined, false).
+
+bucket_type_print_status(Type, undefined) ->
+    io:format("~ts is not an existing bucket type~n", [Type]),
+    {error, undefined};
+bucket_type_print_status(Type, created) ->
+    io:format("~ts has been created but cannot be activated yet~n", [Type]),
+    {error, not_ready};
+bucket_type_print_status(Type, ready) ->
+    io:format("~ts has been created and may be activated~n", [Type]),
+    ok;
+bucket_type_print_status(Type, active) ->
+    io:format("~ts is active~n", [Type]),
+    ok.
+
+bucket_type_print_props(undefined) ->
+    ok;
+bucket_type_print_props(Props) ->
+    io:format("~n"),
+    [io:format("~p: ~p~n", [K, V]) || {K, V} <- Props].
+
+bucket_type_activate([TypeStr]) ->
+    Type = unicode:characters_to_binary(TypeStr, utf8, utf8),
+    IsFirst = bucket_type_is_first(),
+    bucket_type_print_activate_result(Type, riak_core_bucket_type:activate(Type), IsFirst).
+
+bucket_type_print_activate_result(Type, ok, IsFirst) ->
+    io:format("~ts has been activated~n", [Type]),
+    case IsFirst of
+        true ->
+            io:format("~n"),
+            io:format("WARNING: Nodes in this cluster can no longer be~n"
+                      "downgraded to a version of Riak prior to 2.0~n");
+        false ->
+            ok
+    end;
+bucket_type_print_activate_result(Type, {error, undefined}, _IsFirst) ->
+    bucket_type_print_status(Type, undefined);
+bucket_type_print_activate_result(Type, {error, not_ready}, _IsFirst) ->
+    bucket_type_print_status(Type, created).
+
+bucket_type_create([TypeStr, ""]) ->
+    Type = unicode:characters_to_binary(TypeStr, utf8, utf8),
+    EmptyProps = {struct, [{<<"props">>, {struct, []}}]},
+    bucket_type_create(Type, EmptyProps);
+bucket_type_create([TypeStr, PropsStr]) ->
+    Type = unicode:characters_to_binary(TypeStr, utf8, utf8),
+    bucket_type_create(Type, catch mochijson2:decode(PropsStr)).
+
+bucket_type_create(Type, {struct, Fields}) ->
+    case proplists:get_value(<<"props">>, Fields) of
+        {struct, Props} ->
+            ErlProps = [riak_kv_wm_utils:erlify_bucket_prop(P) || P <- Props],
+            bucket_type_print_create_result(Type, riak_core_bucket_type:create(Type, ErlProps));
+        _ ->
+            io:format("Cannot create bucket type ~ts: no props field found in json~n", [Type]),
+            error
+    end;
+bucket_type_create(Type, _) ->
+    io:format("Cannot create bucket type ~ts: invalid json~n", [Type]),
+    error.
+
+bucket_type_print_create_result(Type, ok) ->
+    io:format("~ts created~n", [Type]),
+    case bucket_type_is_first() of
+        true ->
+            io:format("~n"),
+            io:format("WARNING: After activating ~ts, nodes in this cluster~n"
+                      "can no longer be downgraded to a version of Riak "
+                      "prior to 2.0~n", [Type]);
+        false ->
+            ok
+    end;
+bucket_type_print_create_result(Type, {error, Reason}) ->
+    io:format("Error creating bucket type ~ts:~n", [Type]),
+    io:format(bucket_error_xlate(Reason)),
+    io:format("~n"),
+    error.
+
+bucket_type_update([TypeStr, PropsStr]) ->
+    Type = unicode:characters_to_binary(TypeStr, utf8, utf8),
+    bucket_type_update(Type, catch mochijson2:decode(PropsStr)).
+
+bucket_type_update(Type, {struct, Fields}) ->
+    case proplists:get_value(<<"props">>, Fields) of
+        {struct, Props} ->
+            ErlProps = [riak_kv_wm_utils:erlify_bucket_prop(P) || P <- Props],
+            bucket_type_print_update_result(Type, riak_core_bucket_type:update(Type, ErlProps));
+        _ ->
+            io:format("Cannot create bucket type ~ts: no props field found in json~n", [Type]),
+            error
+    end;
+bucket_type_update(Type, _) ->
+    io:format("Cannot update bucket type: ~ts: invalid json~n", [Type]),
+    error.
+
+bucket_type_print_update_result(Type, ok) ->
+    io:format("~ts updated~n", [Type]);
+bucket_type_print_update_result(Type, {error, Reason}) ->
+    io:format("Error updating bucket type ~ts:~n", [Type]),
+    io:format(bucket_error_xlate(Reason)),
+    io:format("~n"),
+    error.
+
+bucket_type_reset([TypeStr]) ->
+    Type = unicode:characters_to_binary(TypeStr, utf8, utf8),
+    bucket_type_print_reset_result(Type, riak_core_bucket_type:reset(Type)).
+
+bucket_type_print_reset_result(Type, ok) ->
+    io:format("~ts reset~n", [Type]);
+bucket_type_print_reset_result(Type, {error, Reason}) ->
+    io:format("Error updating bucket type ~ts: ~p~n", [Type, Reason]),
+    error.
+
+bucket_type_list([]) ->
+    It = riak_core_bucket_type:iterator(),
+    io:format("default (active)~n"),
+    bucket_type_print_list(It).
+
+bucket_type_print_list(It) ->
+    case riak_core_bucket_type:itr_done(It) of
+        true ->
+            riak_core_bucket_type:itr_close(It);
+        false ->
+            {Type, Props} = riak_core_bucket_type:itr_value(It),
+            ActiveStr = case proplists:get_value(active, Props, false) of
+                            true -> "active";
+                            false -> "not active"
+                        end,
+
+            io:format("~ts (~s)~n", [Type, ActiveStr]),
+            bucket_type_print_list(riak_core_bucket_type:itr_next(It))
+    end.
+
+bucket_type_is_first() ->
+    It = riak_core_bucket_type:iterator(),
+    bucket_type_is_first(It, false).
+
+bucket_type_is_first(It, true) ->
+    %% found an active bucket type
+    riak_core_bucket_type:itr_close(It),
+    false;
+bucket_type_is_first(It, false) ->
+    case riak_core_bucket_type:itr_done(It) of
+        true ->
+            %% no active bucket types found
+            ok = riak_core_bucket_type:itr_close(It),
+            true;
+        false ->
+            {_, Props} = riak_core_bucket_type:itr_value(It),
+            Active = proplists:get_value(active, Props, false),
+            bucket_type_is_first(riak_core_bucket_type:itr_next(It), Active)
+    end.
+
 repair_2i(["status"]) ->
     try
         Status = riak_kv_2i_aae:get_status(),
@@ -482,9 +657,12 @@ repair_2i(Args) ->
             case length(IdxList) < 5 of
                 true ->
                     io:format("Will repair 2i on these partitions:\n", []),
-                    [io:format("\t~p\n", [Idx]) || Idx <- IdxList];
+                    _ = [io:format("\t~p\n", [Idx]) || Idx <- IdxList],
+                    ok;
                 false ->
-                    io:format("Will repair 2i data on ~p partitions\n", [length(IdxList)])
+                    io:format("Will repair 2i data on ~p partitions\n",
+                              [length(IdxList)]),
+                    ok
             end,
             Ret = riak_kv_2i_aae:start(IdxList, DutyCycle),
             case Ret of
@@ -518,6 +696,19 @@ repair_2i(Args) ->
             io:format("If no partitions are given, all partitions in the\n"
                       "node are repaired\n", []),
             error
+    end.
+
+ensemble_status([]) ->
+    riak_kv_ensemble_console:ensemble_overview();
+ensemble_status(["root"]) ->
+    riak_kv_ensemble_console:ensemble_detail(root);
+ensemble_status([Str]) ->
+    N = parse_int(Str),
+    case N of
+        undefined ->
+            io:format("No such ensemble: ~s~n", [Str]);
+        _ ->
+            riak_kv_ensemble_console:ensemble_detail(N)
     end.
 
 %%%===================================================================
@@ -631,3 +822,27 @@ print_vnode_status([StatusItem | RestStatusItems]) ->
             io:format("Status: ~n~p~n", [StatusItem])
     end,
     print_vnode_status(RestStatusItems).
+
+bucket_error_xlate(Errors) when is_list(Errors) ->
+    string:join(
+      lists:map(fun bucket_error_xlate/1, Errors),
+      "~n");
+bucket_error_xlate({Property, not_integer}) ->
+    [atom_to_list(Property), " must be an integer"];
+
+%% `riak_kv_bucket:coerce_bool/1` allows for other values but let's
+%% not encourage bad behavior
+bucket_error_xlate({Property, not_boolean}) ->
+    [atom_to_list(Property), " should be \"true\" or \"false\""];
+
+bucket_error_xlate({Property, not_valid_quorum}) ->
+    [atom_to_list(Property), " must be an integer or (one|quorum|all)"];
+bucket_error_xlate({_Property, Error}) when is_list(Error)
+                                            orelse is_binary(Error) ->
+    Error;
+bucket_error_xlate({Property, Error}) when is_atom(Error) ->
+    [atom_to_list(Property), ": ", atom_to_list(Error)];
+bucket_error_xlate({Property, Error}) ->
+    [atom_to_list(Property), ": ", io_lib:format("~p", [Error])];
+bucket_error_xlate(X) ->
+    io_lib:format("~p", [X]).

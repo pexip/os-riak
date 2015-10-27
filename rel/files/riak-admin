@@ -6,7 +6,7 @@
 . "{{runner_base_dir}}/lib/env.sh"
 
 # Make sure the user running this script is the owner and/or su to that user
-check_user $@
+check_user "$@"
 ES=$?
 if [ "$ES" -ne 0 ]; then
     exit $ES
@@ -26,9 +26,215 @@ usage() {
     echo "                    reip | js-reload | erl-reload | wait-for-service | "
     echo "                    ringready | transfers | force-remove | down |"
     echo "                    cluster-info | member-status | ring-status | vnode-status |"
-    echo "                    aae-status | diag | status | transfer-limit | reformat-indexes |"
+    echo "                    aae-status | diag | stat | status | transfer-limit | reformat-indexes |"
     echo "                    top [-interval N] [-sort reductions|memory|msg_q] [-lines N] |"
-    echo "                    downgrade-objects | repair-2i }"
+    echo "                    downgrade-objects | security | bucket-type | repair-2i |"
+    echo "                    search | services | ensemble-status | handoff | set |"
+    echo "                    show | describe }"
+}
+
+stat_admin()
+{
+    case "$1" in
+        show)
+            shift
+            node_up_check
+            $NODETOOL rpc riak_core_console stat_show "$*"
+            ;;
+       info)
+            shift
+            node_up_check
+            $NODETOOL rpc riak_core_console stat_info "$*"
+            ;;
+        enable)
+            shift
+            node_up_check
+            $NODETOOL rpc riak_core_console stat_enable "$*"
+            ;;
+        disable)
+            shift
+            node_up_check
+            $NODETOOL rpc riak_core_console stat_disable "$*"
+            ;;
+        reset)
+            shift
+            node_up_check
+            $NODETOOL rpc riak_core_console stat_reset "$*"
+            ;;
+        help)
+            shift
+            case $1 in
+                show)
+                    stat_show_help
+                    ;;
+                enable)
+                    stat_enable_help
+                    ;;
+                disable)
+                    stat_enable_help
+                    ;;
+                info)
+                    stat_info_help
+                    ;;
+                *)
+                    stat_help
+            esac
+            ;;
+        *)
+            stat_help
+    esac
+}
+
+stat_help()
+{
+    echo "\
+Usage: $SCRIPT stat <command>
+
+The following commands display, enable/disable and reset statistics.
+A statistics entry is given either as a 'dotted' exometer name -
+Identifiers separated by periods, '.', e.g. riak.riak_kv.node.gets,
+or as a 'legacy' name (same as in riak-admin status) - e.g. node_gets.
+When a legacy name is listed, the corresponding exometer name is shown as well.
+
+Two kinds of wildcard are suppored:
+*  - matches anything up to the next separator ('.' or '_') or end of name;
+** - matches anything including separators.
+Quoting is permitted.
+
+Use \`$SCRIPT stat help <command>\` for more details.
+
+   show <entry>                Show the value(s) of a specific entry or entries
+   enable <entry>              Enable entry or entries
+   disable <entry>             Disable entry or entries
+   reset <entry>               Reset entry or entries
+   info [ -name | -type |      Display information about the entry or entries.
+        | -module              The attributes are described in the Exometer docs
+        | -value | -cache
+        | -status | -timestamp
+        | -options | -ref
+        | -datapoints ] <entry>
+"
+}
+
+stat_show_help()
+{
+    echo "\
+Usage: $SCRIPT stat show <entry>[/type=<type>][/status=<status>][/<dp>[,<dp>]]
+
+Show matching stats entries together with corresponding values
+
+The format of <entry> can be one of:
+- 'Dotted exometer name': In Exometer, entries are represented as [A,B,...].
+These names can be emulated on the command-line as A.B.... Wildcards are
+supported: '*' will match anything between deliminators (dots), whereas
+'**' will match anything including deliminators. Thus \`stat show \"*.**\"\`
+will match all stats entries. All Riak stat entry names start with 'riak',
+so \`stat show riak.**\` will match all riak stat entries.
+
+Example:
+\$ bin/riak-admin stat show riak.riak_kv.node.gets
+[riak,riak_kv,node,gets]: [{count,0},{one,0}]
+
+- 'Legacy name': The stat names used e.g. in \`$SCRIPT status\` can be used
+here, but also with wildcard support. The corresponding Exometer name and
+datapoint will be shown as well.
+
+Example:
+\$ bin/riak-admin stat show node_gets
+== node_gets (Legacy pattern): ==
+node_gets: 0 ([riak,riak_kv,node,gets]/one)
+
+(Note: A single '*' is treated as a legacy name and would match all such
+names that contain no underscores; to match all exometer names, a '.' must
+be present, so '*.**' would work as a catch-all expression.)
+
+Each Exometer entry has a type and a set of datapoints. A filter can be
+given on the command line, selecting only a subset of datapoints:
+
+\$ bin/riak-admin stat show riak.riak_kv.node.gets/one
+[riak,riak_kv,node,gets]: [{one,0}]
+
+The type can also be restricted:
+\$ bin/riak-admin stat show *.**/type=duration/mean,max
+[riak,riak_core,converge_delay]: [{mean,0},{max,0}]
+[riak,riak_core,rebalance_delay]: [{mean,0},{max,0}]
+
+Note how multiple datapoints are separated by comma (no space).
+
+Showing disabled entries:
+\$ bin/riak-admin stat show riak.riak_kv.node.gets
+No matching stats
+\$ bin/riak-admin stat show riak.riak_kv.node.gets/status=*
+[riak,riak_kv,node,gets]: disabled
+\$ bin/riak-admin stat show riak.riak_kv.node.gets/status=disabled
+[riak,riak_kv,node,gets]: disabled
+"
+}
+
+stat_enable_help()
+{
+    echo "\
+Exometer stats can be disabled and enabled, and this can be done from $SCRIPT
+using \`$SCRIPT enable|disable <entry>\`. Disabled entries are not actively
+updated, and have no value.
+
+The same syntax can be used as in \`stat show\`. The requested action will be
+performed on the matching entries.
+
+\$ bin/riak-admin stat disable node_gets
+== node_gets (Legacy pattern): ==
+[riak,riak_kv,node,gets]: disabled
+\$ bin/riak-admin stat enable node_gets
+== node_gets (Legacy pattern): ==
+[riak,riak_kv,node,gets]: enabled
+
+Wildcards can be used:
+
+\$ bin/riak-admin stat disable riak.riak_kv.node.*
+[riak,riak_kv,node,gets]: disabled
+[riak,riak_kv,node,puts]: disabled
+"
+}
+
+stat_info_help()
+{
+    echo "\
+Display Exometer meta-data for matching entries. Type of data can be controlled
+with options:
+
+   info [ -name | -type
+        | -module
+        | -value | -cache
+        | -status | -timestamp
+        | -options | -ref
+        | -datapoints ] <entry>
+
+The same entry formats can be used as for all other stat subcommands.
+
+Example:
+\$ bin/riak-admin stat info riak.riak_kv.node.gets
+[riak,riak_kv,node,gets]: name = [riak,riak_kv,node,gets]
+                          type = spiral
+                          module = exometer_spiral
+                          value = disabled
+                          cache = 0
+                          status = disabled
+                          timestamp = undefined
+                          options = [{status,disabled}]
+
+\$ bin/riak-admin stat info -type -status riak.riak_kv.node.gets
+[riak,riak_kv,node,gets]: type = spiral
+                          status = disabled
+"
+}
+
+stat_reset_help()
+{
+    echo "\
+Usage: $SCRIPT stat reset <entry>
+
+Reset matching stat entries. Only enabled entries can be reset.
+"
 }
 
 cluster_admin()
@@ -99,6 +305,19 @@ cluster_admin()
             node_up_check
             $NODETOOL rpc riak_core_console clear_staged
             ;;
+        status)
+            node_up_check
+            $NODETOOL rpc riak_core_console command $SCRIPT cluster $@
+            ;;
+        partitions|partition)
+            node_up_check
+            $NODETOOL rpc riak_core_console command $SCRIPT cluster $@
+            ;;
+        partition[_-]count)
+            node_up_check
+            shift
+            $NODETOOL rpc riak_core_console command $SCRIPT cluster partition-count $@
+            ;;
         *)
             echo "\
 Usage: $SCRIPT cluster <command>
@@ -107,25 +326,340 @@ The following commands stage changes to cluster membership. These commands
 do not take effect immediately. After staging a set of changes, the staged
 plan must be committed to take effect:
 
-   join <node>                    Join node to the cluster containing <node>
-   leave                          Have this node leave the cluster and shutdown
-   leave <node>                   Have <node> leave the cluster and shutdown
+   join <node>                     Join node to the cluster containing <node>
+   leave                           Have this node leave the cluster and shutdown
+   leave <node>                    Have <node> leave the cluster and shutdown
 
-   force-remove <node>            Remove <node> from the cluster without
-                                  first handing off data. Designed for
-                                  crashed, unrecoverable nodes
+   force-remove <node>             Remove <node> from the cluster without
+                                   first handing off data. Designed for
+                                   crashed, unrecoverable nodes
 
-   replace <node1> <node2>        Have <node1> transfer all data to <node2>,
-                                  and then leave the cluster and shutdown
+   replace <node1> <node2>         Have <node1> transfer all data to <node2>,
+                                   and then leave the cluster and shutdown
 
-   force-replace <node1> <node2>  Reassign all partitions owned by <node1> to
-                                  <node2> without first handing off data, and
-                                  remove <node1> from the cluster.
+   force-replace <node1> <node2>   Reassign all partitions owned by <node1> to
+                                   <node2> without first handing off data, and
+                                   remove <node1> from the cluster.
 
 Staging commands:
-   plan                           Display the staged changes to the cluster
-   commit                         Commit the staged changes
-   clear                          Clear the staged changes
+   plan                            Display the staged changes to the cluster
+   commit                          Commit the staged changes
+   clear                           Clear the staged changes
+
+Status and information commands:
+   status                          Display a concise summary of node membership
+                                   availability and ring ownership.
+
+   partitions [--node=<node>]      Print primary, secondary and stopped
+                                   partition indices and ids for the current
+                                   node, or for the specified node.
+
+   partition-count [--node=<node>] Print the cluster-wide number of
+                                   partitions or the number of partitions
+                                   on the specified node.
+
+   partition id=<id>               Convert the given partition id to the
+                                   matching index.
+
+   partition index=<index>         Convert the given partition index to
+                                   the matching id.
+
+"
+    esac
+}
+
+security_admin()
+{
+    case "$1" in
+        add-user)
+            shift
+            if [ $# -lt 1 ]; then
+                echo "Usage: $SCRIPT security add-user <user> [<option>=<value> [...]]"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console add_user "$@"
+            if [ $? -eq 0 ]; then
+                $NODETOOL rpc riak_core_console print_user "$1"
+            fi
+            ;;
+        add-group)
+            shift
+            if [ $# -lt 1 ]; then
+                echo "Usage: $SCRIPT security add-group <group> [<option>=<value> [...]]"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console add_group "$@"
+            if [ $? -eq 0 ]; then
+                $NODETOOL rpc riak_core_console print_group "$1"
+            fi
+            ;;
+        alter-user)
+            shift
+            if [ $# -lt 2 ]; then
+                echo "Usage: $SCRIPT security alter-user <user> <option> [<option>=<value> [...]]"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console alter_user "$@"
+            if [ $? -eq 0 ]; then
+                $NODETOOL rpc riak_core_console print_user "$1"
+            fi
+            ;;
+        alter-group)
+            shift
+            if [ $# -lt 2 ]; then
+                echo "Usage: $SCRIPT security alter-group <group> <option> [<option>=<value> [...]]"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console alter_group "$@"
+            if [ $? -eq 0 ]; then
+                $NODETOOL rpc riak_core_console print_group "$1"
+            fi
+            ;;
+        del-user)
+            shift
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT security del-user <user>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console del_user "$@"
+            ;;
+        del-group)
+            shift
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT security del-group <user>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console del_group "$@"
+            ;;
+        add-source)
+            shift
+            if [ $# -lt 3 ]; then
+                echo "Usage: $SCRIPT security add-source all|<users> <CIDR> <source> [<option>=<value> [...]]"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console add_source "$@"
+            ;;
+        del-source)
+            shift
+            if [ $# -ne 2 ]; then
+                echo "Usage: $SCRIPT security del-source all|<users> <CIDR>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console del_source "$@"
+            ;;
+        grant)
+            shift
+            if [ $# -lt 5 ]; then
+                echo "Usage: $SCRIPT security grant <permissions> on any|<type> [bucket] to <users>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console grant "$@"
+            ;;
+        revoke)
+            shift
+            if [ $# -lt 5 ]; then
+                echo "Usage: $SCRIPT security revoke <permissions> on any|<type> [bucket] from <users>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console revoke "$@"
+            ;;
+        print-users)
+            $NODETOOL rpc riak_core_console print_users
+            ;;
+        print-groups)
+            $NODETOOL rpc riak_core_console print_groups
+            ;;
+        print-sources)
+            $NODETOOL rpc riak_core_console print_sources
+            ;;
+        enable)
+            $NODETOOL rpc riak_core_console security_enable
+            $NODETOOL rpc riak_core_console security_status
+            ;;
+        disable)
+            $NODETOOL rpc riak_core_console security_disable
+            $NODETOOL rpc riak_core_console security_status
+            ;;
+        status)
+            $NODETOOL rpc riak_core_console security_status
+            ;;
+        print-grants)
+            shift
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT security print-grants <user>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console print_grants "$@"
+            ;;
+        print-user)
+            shift
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT security print-user <user>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console print_user "$@"
+            ;;
+        print-group)
+            shift
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT security print-group <group>"
+                exit 1
+            fi
+            $NODETOOL rpc riak_core_console print_group "$@"
+            ;;
+        ciphers)
+            shift
+            $NODETOOL rpc riak_core_console ciphers "$@"
+            ;;
+        *)
+            echo "\
+Usage: $SCRIPT security <command>
+
+The following commands modify users and security ACLs for Riak:
+
+    add-user <username> [<option>=<value> [...]]
+    add-group <groupname> [<option>=<value> [...]]
+    alter-user <username> <option> [<option>=<value> [...]]
+    alter-group <groupname> <option> [<option>=<value> [...]]
+    del-user <username>
+    del-group <groupname>
+    add-source all|<users> <CIDR> <source> [<option>=<value> [...]]
+    del-source all|<users> <CIDR>
+    grant <permissions> on any|<type> [bucket] to <users>
+    revoke <permissions> on any|<type> [bucket] from <users>
+    print-users
+    print-groups
+    print-user <user>
+    print-group <group>
+    print-grants <user|group>
+    print-sources
+    enable
+    disable
+    status
+    ciphers [cipherlist]
+"
+    esac
+}
+
+search_admin()
+{
+    case "$1" in
+        aae[_-]status)
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT search $1"
+                exit 1
+            fi
+            shift
+
+            # Make sure the local node is running
+            node_up_check
+
+            $NODETOOL rpc yz_console aae_status "$@"
+            ;;
+        switch[_-]to[_-]new[_-]search)
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT search $1"
+                exit 1
+            fi
+            shift
+
+            # Make sure the local node is running
+            node_up_check
+
+            $NODETOOL rpc yz_console switch_to_new_search "$@"
+            ;;
+        *)
+echo "\
+Usage: $SCRIPT search <command>
+
+Available commands:
+
+    aae-status
+    switch-to-new-search
+"
+    esac
+}
+
+btype_admin()
+{
+    case "$1" in
+        status)
+            if [ $# -ne 2 ]; then
+                echo "Usage: $SCRIPT bucket-type status <type>";
+                exit 1
+            fi
+            node_up_check
+            $NODETOOL rpc riak_kv_console bucket_type_status "$2"
+            ;;
+        activate)
+            if [ $# -ne 2 ]; then
+                echo "Usage: $SCRIPT bucket-type activate <type>"
+                exit 1
+            fi
+            node_up_check
+            $NODETOOL rpc riak_kv_console bucket_type_activate "$2"
+            ;;
+        create)
+            if [ $# -lt 2 ]; then
+                echo "Usage: $SCRIPT bucket-type create <type> ['{\"props\": { ... }}']"
+                exit 1
+            fi
+            node_up_check
+
+            # Allow for both command line styles (quoted 3rd param) or $@ parameters
+            #     bucket-type create <type> '{"props": { ... }}'"
+            #     bucket-type create <type> {"props": { ... }}"
+            #
+            if [ $# -le 3 ]; then
+                json=${3:-}
+                $NODETOOL rpc riak_kv_console bucket_type_create "$2" "$json"
+            else  # greater than 3 parameters
+                two=$2
+                shift 2
+                three=$@
+                $NODETOOL rpc riak_kv_console bucket_type_create "$two" "$three"
+            fi
+
+            ;;
+        update)
+            if [ $# -lt 3 ]; then
+                echo "Usage: $SCRIPT bucket-type update <type> '{\"props\": { ... }}'"
+                exit 1
+            fi
+            node_up_check
+
+            # Allow for both command line styles (quoted 3rd param) or $@ parameters
+            #     bucket-type update <type> '{"props": { ... }}'"
+            #     bucket-type update <type> {"props": { ... }}"
+            #
+            if [ $# -eq 3 ]; then
+                $NODETOOL rpc riak_kv_console bucket_type_update "$2" "$3"
+            else  # greater than 3 parameters
+                two=$2
+                shift 2
+                three=$@
+                $NODETOOL rpc riak_kv_console bucket_type_update "$two" "$three"
+            fi
+            ;;
+        list)
+            if [ $# -ne 1 ]; then
+                echo "Usage: $SCRIPT bucket-type list"
+                exit 1
+            fi
+            node_up_check
+            $NODETOOL rpc riak_kv_console bucket_type_list
+            ;;
+        *)
+            echo "\
+Usage: $SCRIPT bucket-type <command>
+
+The follow commands can be used to manage bucket types for the cluster:
+
+   list                           List all bucket types and their activation status
+   status <type>                  Display the status and properties of a type
+   activate <type>                Activate a type
+   create <type> <json>           Create or modify a type before activation
+   update <type> <json>           Update a type after activation
 "
     esac
 }
@@ -210,7 +744,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_console down $@
+        $NODETOOL rpc riak_kv_console down "$@"
         ;;
 
     status)
@@ -223,7 +757,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_console status $@
+        $NODETOOL rpc riak_kv_console status "$@"
         ;;
 
     vnode[_-]status)
@@ -236,7 +770,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_console vnode_status $@
+        $NODETOOL rpc riak_kv_console vnode_status "$@"
         ;;
 
     ringready)
@@ -249,7 +783,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_console ringready $@
+        $NODETOOL rpc riak_kv_console ringready "$@"
         ;;
 
     transfers)
@@ -262,7 +796,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_core_console transfers $@
+        $NODETOOL rpc riak_core_console transfers "$@"
         ;;
 
     member[_-]status)
@@ -275,7 +809,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_core_console member_status $@
+        $NODETOOL rpc riak_core_console member_status "$@"
         ;;
 
     ring[_-]status)
@@ -288,7 +822,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_core_console ring_status $@
+        $NODETOOL rpc riak_core_console ring_status "$@"
         ;;
 
     aae[_-]status)
@@ -301,7 +835,20 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_console aae_status $@
+        $NODETOOL rpc riak_kv_console aae_status "$@"
+        ;;
+
+    ensemble[_-]status)
+        if [ $# -ne 1 ] && [ $# -ne 2 ]; then
+            echo "Usage: $SCRIPT $1 [<ensemble>]"
+            exit 1
+        fi
+        shift
+
+        # Make sure the local node is running
+        node_up_check
+
+        $NODETOOL rpc riak_kv_console ensemble_status "$@"
         ;;
 
     repair[_-]2i)
@@ -310,7 +857,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_console repair_2i $@
+        $NODETOOL rpc riak_kv_console repair_2i "$@"
         ;;
 
     cluster[_-]info)
@@ -323,18 +870,24 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc_infinity riak_kv_console cluster_info $@
+        $NODETOOL rpc_infinity riak_kv_console cluster_info "$@"
         ;;
 
     services)
+        if [ $# -ne 1 ]; then
+            echo "Usage: $SCRIPT $1"
+            echo ""
+            echo "Lists the services available on the node. See also: wait-for-service"
+            exit 1
+        fi
         $NODETOOL rpcterms riak_core_node_watcher services ''
         ;;
 
     wait[_-]for[_-]service)
         SVC=$2
         TARGETNODE=$3
-        if [ $# -lt 3 ]; then
-            echo "Usage: $SCRIPT $1 <service_name> <target_node>"
+        if [ $# -lt 2 ]; then
+            echo "Usage: $SCRIPT $1 <service_name> [<target_node>]"
             exit 1
         fi
 
@@ -347,8 +900,13 @@ case "$1" in
                 continue
             fi
 
-            # Get the list of services that are available on the requested noe
-            SERVICES=`$NODETOOL rpcterms riak_core_node_watcher services "'${TARGETNODE}'."`
+            # Get the list of services that are available on the requested node
+            # If no node is specified, get the list of services from the local node
+            if [ "X$TARGETNODE" = "X" ]; then
+                SERVICES=`$NODETOOL rpcterms riak_core_node_watcher services ''`
+            else
+                SERVICES=`$NODETOOL rpcterms riak_core_node_watcher services "'${TARGETNODE}'."`
+            fi
             echo "$SERVICES" | grep "[[,]$SVC[],]" > /dev/null 2>&1
             if [ "X$?" = "X0" ]; then
                 echo "$SVC is up"
@@ -368,7 +926,7 @@ case "$1" in
         # Make sure the local node is running
         node_up_check
 
-        $NODETOOL rpc riak_kv_js_manager reload $@
+        $NODETOOL rpc riak_kv_js_manager reload "$@"
         ;;
 
     erl[_-]reload)
@@ -387,14 +945,21 @@ case "$1" in
             exit 1
         fi
 
-        # Make sure the local node is running
-        node_up_check
+        # Make sure the local node is not running
+        node_down_check
+
+        # Sanity check the app.config file
+        check_config
+        ES=$?
+        if [ "$ES" -ne 0 ]; then
+            exit $ES
+        fi
 
         OLDNODE=$1
         NEWNODE=$2
         $ERTS_PATH/erl -noshell \
             -pa $RUNNER_LIB_DIR/basho-patches \
-            -config $RUNNER_ETC_DIR/app.config \
+            $CONFIG_ARGS \
             -eval "riak_kv_console:$ACTION(['$OLDNODE', '$NEWNODE'])" \
             -s init stop
         ;;
@@ -413,8 +978,8 @@ case "$1" in
         FILENAME=$3
 
         $ERTS_PATH/erl -noshell $NAME_PARAM riak_kv_backup$NAME_HOST -setcookie $COOKIE \
-                    -pa $RUNNER_LIB_DIR/basho-patches \
-                    -eval "riak_kv_backup:$ACTION('$NODE', \"$FILENAME\")" -s init stop
+                       -pa $RUNNER_LIB_DIR/basho-patches \
+                       -eval "riak_kv_backup:$ACTION('$NODE', \"$FILENAME\")" -s init stop
         ;;
 
     backup)
@@ -432,8 +997,8 @@ case "$1" in
         TYPE=$4
 
         $ERTS_PATH/erl -noshell $NAME_PARAM riak_kv_backup$NAME_HOST -setcookie $COOKIE \
-                    -pa $RUNNER_LIB_DIR/basho-patches \
-                    -eval "riak_kv_backup:$ACTION('$NODE', \"$FILENAME\", \"$TYPE\")" -s init stop
+                       -pa $RUNNER_LIB_DIR/basho-patches \
+                       -eval "riak_kv_backup:$ACTION('$NODE', \"$FILENAME\", \"$TYPE\")" -s init stop
         ;;
 
     test)
@@ -446,11 +1011,11 @@ case "$1" in
         NODE_NAME=${NAME_ARG#* }
 
         $ERTS_PATH/erl -noshell $NAME_PARAM riak_test$NAME_HOST $COOKIE_ARG \
-                    -pa $RUNNER_LIB_DIR/basho-patches \
-                    -eval "case catch(riak:client_test(\"$NODE_NAME\")) of \
-                            ok -> init:stop();                             \
-                            _  -> init:stop(1)                             \
-                            end."
+                       -pa $RUNNER_LIB_DIR/basho-patches \
+                       -eval "case catch(riak:client_test(\"$NODE_NAME\")) of \
+                               ok -> init:stop();                             \
+                               _  -> init:stop(1)                             \
+                              end."
 
         ;;
     diag)
@@ -496,6 +1061,34 @@ case "$1" in
         shift
         cluster_admin "$@"
         ;;
+    stat)
+        shift
+        stat_admin "$@"
+        ;;
+    bucket-type)
+        shift
+        btype_admin "$@"
+        ;;
+    handoff)
+        # New pattern for command line. Use nodetool for RPC
+        node_up_check
+        exec $NODETOOL rpc riak_core_console command $SCRIPT $@
+        ;;
+    set)
+        # New pattern for command line. Use nodetool for RPC
+        node_up_check
+        exec $NODETOOL rpc riak_core_console command $SCRIPT $@
+        ;;
+    show)
+        # New pattern for command line. Use nodetool for RPC
+        node_up_check
+        exec $NODETOOL rpc riak_core_console command $SCRIPT $@
+        ;;
+    describe)
+        # New pattern for command line. Use nodetool for RPC
+        node_up_check
+        exec $NODETOOL rpc riak_core_console command $SCRIPT $@
+        ;;
     transfer[_-]limit)
         if [ $# -gt 3 ]; then
             echo "Usage: $SCRIPT $1"
@@ -527,6 +1120,14 @@ case "$1" in
         node_up_check
         shift
         $NODETOOL rpc riak_kv_console reformat_objects "$@"
+        ;;
+    security)
+        shift
+        security_admin "$@"
+        ;;
+    search)
+        shift
+        search_admin "$@"
         ;;
     *)
         usage

@@ -13,6 +13,7 @@
 #include "leveldb/cache.h"
 #include "leveldb/table.h"
 #include "port/port.h"
+#include "util/cache2.h"
 
 namespace leveldb {
 
@@ -20,7 +21,8 @@ class Env;
 
 class TableCache {
  public:
-  TableCache(const std::string& dbname, const Options* options, int entries);
+  TableCache(const std::string& dbname, const Options* options, Cache * file_cache,
+             DoubleCache & doublecache);
   ~TableCache();
 
   // Return an iterator for the specified file number (the corresponding
@@ -49,17 +51,24 @@ class TableCache {
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number, bool is_overlapped);
 
+  // Riak specific:  return table statistic ONLY if table in cache, otherwise zero
+  uint64_t GetStatisticValue(uint64_t file_number, unsigned Index);
+
+
   // access for testing tools, not for public access
   Status TEST_FindTable(uint64_t file_number, uint64_t file_size, int level, Cache::Handle** handle)
   {return( FindTable(file_number, file_size, level, handle));};
 
   Cache* TEST_GetInternalCache() {return(cache_);};
 
+  void Release(Cache::Handle * handle) {cache_->Release(handle);};
+
  private:
   Env* const env_;
   const std::string dbname_;
   const Options* options_;
-  Cache* cache_;
+  Cache * cache_;
+  DoubleCache & doublecache_;
 
   Status FindTable(uint64_t file_number, uint64_t file_size, int level, Cache::Handle**, bool is_compaction=false);
 };
@@ -68,6 +77,10 @@ class TableCache {
 struct TableAndFile {
   RandomAccessFile* file;
   Table* table;
+  DoubleCache * doublecache;
+
+   TableAndFile()
+   : file(NULL), table(NULL), doublecache(NULL) {};
 };
 
 

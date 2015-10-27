@@ -1,8 +1,8 @@
 %% -------------------------------------------------------------------
 %%
-%% stats_http_resource: publishing Riak runtime stats via HTTP
+%% riak_kv_wm_stats: publishing Riak runtime stats via HTTP
 %%
-%% Copyright (c) 2007-2010 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2007-2013 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -21,7 +21,6 @@
 %% -------------------------------------------------------------------
 
 -module(riak_kv_wm_stats).
--author('Andy Gross <andy@basho.com>').
 
 %% webmachine resource exports
 -export([
@@ -33,6 +32,7 @@
          produce_body/2,
          pretty_print/2
         ]).
+-export([get_stats/0]).
 
 -include_lib("webmachine/include/webmachine.hrl").
 
@@ -74,7 +74,8 @@ forbidden(RD, Ctx) ->
     {riak_kv_wm_utils:is_forbidden(RD), RD, Ctx}.
 
 produce_body(ReqData, Ctx) ->
-    Body = mochijson2:encode({struct, get_stats()}),
+    Stats= riak_kv_http_cache:get_stats(),
+    Body = mochijson2:encode({struct, Stats}),
     {Body, ReqData, Ctx}.
 
 %% @spec pretty_print(webmachine:wrq(), context()) ->
@@ -84,6 +85,6 @@ pretty_print(RD1, C1=#ctx{}) ->
     {Json, RD2, C2} = produce_body(RD1, C1),
     {json_pp:print(binary_to_list(list_to_binary(Json))), RD2, C2}.
 
+
 get_stats() ->
-    proplists:delete(disk, riak_kv_stat:get_stats()) ++
-        riak_core_stat:get_stats().
+    riak_kv_status:get_stats(web).

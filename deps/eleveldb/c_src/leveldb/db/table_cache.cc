@@ -14,6 +14,8 @@ namespace leveldb {
 
 static void DeleteEntry(const Slice& key, void* value) {
   TableAndFile* tf = reinterpret_cast<TableAndFile*>(value);
+  if (NULL!=tf->doublecache)
+      tf->doublecache->SubFileSize(tf->table->GetFileSize());
   delete tf->table;
   delete tf->file;
   delete tf;
@@ -27,23 +29,17 @@ static void UnrefEntry(void* arg1, void* arg2) {
 
 TableCache::TableCache(const std::string& dbname,
                        const Options* options,
-                       int entries)
+                       Cache * file_cache,
+                       DoubleCache & doublecache)
     : env_(options->env),
       dbname_(dbname),
       options_(options),
-
-      // convert file handle limit into a size limit
-      //  based upon sampling of metadata data sizes across
-      //  levels and various load characteristics
-      // Use NewLRUCache2 because it is NOT sharded.  Sharding
-      //  does horrible things to file cache due to hash function
-      //  not being very good and "capacity" does not split well
-      cache_(NewLRUCache2(entries * (4*1048576)))
+      cache_(file_cache),
+      doublecache_(doublecache)
 {
 }
 
 TableCache::~TableCache() {
-  delete cache_;
 }
 
 Status TableCache::FindTable(uint64_t file_number, uint64_t file_size, int level,
@@ -54,7 +50,7 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size, int level
   Slice key(buf, sizeof(buf));
   *handle = cache_->Lookup(key);
   if (*handle == NULL) {
-    std::string fname = TableFileName(dbname_, file_number, level);
+    std::string fname = TableFileName(*options_, file_number, level);
     RandomAccessFile* file = NULL;
     Table* table = NULL;
     s = env_->NewRandomAccessFile(fname, &file);
@@ -75,10 +71,12 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size, int level
       TableAndFile* tf = new TableAndFile;
       tf->file = file;
       tf->table = table;
+      tf->doublecache = &doublecache_;
 
       *handle = cache_->Insert(key, tf, table->TableObjectSize(), &DeleteEntry);
 //      *handle = cache_->Insert(key, tf, 1, &DeleteEntry);
       gPerfCounters->Inc(ePerfTableOpened);
+      doublecache_.AddFileSize(table->GetFileSize());
 
       // temporary hardcoding to match number of levels defined as
       //  overlapped in version_set.cc
@@ -111,6 +109,7 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
 
   Cache::Handle* handle = NULL;
   Status s = FindTable(file_number, file_size, level, &handle, options.IsCompaction());
+
   if (!s.ok()) {
     return NewErrorIterator(s);
   }
@@ -133,6 +132,7 @@ Status TableCache::Get(const ReadOptions& options,
                        bool (*saver)(void*, const Slice&, const Slice&)) {
   Cache::Handle* handle = NULL;
   Status s = FindTable(file_number, file_size, level, &handle);
+
   if (s.ok()) {
     Table* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
     s = t->InternalGet(options, k, arg, saver);
@@ -158,12 +158,43 @@ void TableCache::Evict(uint64_t file_number, bool is_overlapped) {
       //  evicted
       if (NULL!=handle)
       {
-          cache_->Release(handle);
-          cache_->Release(handle);
+          cache_->Release(handle);  // release for Lookup() call just made
+          cache_->Release(handle);  // release for extra reference
       }   // if
   }   // if
 
   cache_->Erase(Slice(buf, sizeof(buf)));
 }
+
+/**
+ * Riak specific routine to return table statistic ONLY if table metadata
+ *  already within cache ... otherwise return 0.
+ */
+uint64_t
+TableCache::GetStatisticValue(
+    uint64_t file_number,
+    unsigned Index)
+{
+    uint64_t ret_val;
+    char buf[sizeof(file_number)];
+    Cache::Handle *handle;
+
+    ret_val=0;
+    EncodeFixed64(buf, file_number);
+    Slice key(buf, sizeof(buf));
+    handle = cache_->Lookup(key);
+
+    if (NULL != handle)
+    {
+        TableAndFile * tf;
+
+        tf=reinterpret_cast<TableAndFile*>(cache_->Value(handle));
+        ret_val=tf->table->GetSstCounters().Value(Index);
+        cache_->Release(handle);
+    }   // if
+
+    return(ret_val);
+
+}   // TableCache::GetStatisticValue
 
 }  // namespace leveldb

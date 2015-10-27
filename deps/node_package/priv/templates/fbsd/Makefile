@@ -37,7 +37,7 @@ build: packing_list_files templates
 	mv $(TARNAME).gz ../../packages/$(PKGNAME)
 
 	cd ../packages && \
-		for tarfile in `ls *.tbz`; do \
+		for tarfile in *.tbz; do \
 		shasum -a 256 $${tarfile} > $${tarfile}.sha \
 	; done
 
@@ -153,7 +153,7 @@ $(BUILD_STAGE_DIR): buildrel
 #  * Ensure all binaries are executable
 #  * copy the vars.config over for build config
 buildrel:
-	OVERLAY_VARS="overlay_vars=../fbsd/vars.config" $(MAKE) deps rel
+	OVERLAY_VARS="overlay_vars=../fbsd/vars.config" $(MAKE) rel
 	chmod 0755 rel/{{package_install_name}}/bin/* rel/{{package_install_name}}/erts-*/bin/*
 
 $(BUILDDIR):

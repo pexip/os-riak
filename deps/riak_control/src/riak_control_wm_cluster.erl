@@ -18,16 +18,9 @@
 %%
 %% -------------------------------------------------------------------
 %%
-%% @doc
-%%
-%% Responsible for viewing, staging and committing changes to the
-%% cluster.
-%%
-%% GET  /cluster returns the current and staged clusters.
-%% PUT  /cluster updates the plan.
-%% POST /cluster updates and commits the plan.
-%%
-%% @end
+%% @doc Provides a resource for getting the current cluster status,
+%%      as well as a resource for updating the staged cluster plan, and
+%%      committing the staged cluster plan.
 
 -module(riak_control_wm_cluster).
 
@@ -44,7 +37,7 @@
          content_types_provided/2,
          content_types_accepted/2]).
 
--include_lib("riak_control/include/riak_control.hrl").
+-include("riak_control.hrl").
 -include_lib("webmachine/include/webmachine.hrl").
 
 %% @doc Return routes this resource should respond to.
@@ -183,9 +176,9 @@ extract_changes(ReqData, _Context) ->
     {true, wrq:reqdata(), undefined}.
 delete_resource(ReqData, Context) ->
     Result = case riak_control_session:clear_plan() of
-        {ok, ok} ->
+        ok ->
             true;
-        {ok, error} ->
+        error ->
             false
     end,
     {Result, ReqData, Context}.
@@ -193,10 +186,13 @@ delete_resource(ReqData, Context) ->
 %% @doc Return the current cluster, along with a plan if it's available.
 -spec to_json(wrq:reqdata(), undefined) -> {binary(), wrq:reqdata(), undefined}.
 to_json(ReqData, Context) ->
+    %% Get the current claimant.
+    Ring = riak_control_ring:ring(),
+    Claimant = riak_core_ring:claimant(Ring),
 
     %% Get the current node list.
     {ok, _V, Nodes} = riak_control_session:get_nodes(),
-    Current = [jsonify_node(Node) || Node=?MEMBER_INFO{} <- Nodes],
+    Current = [jsonify_node(Node, Claimant) || Node=?MEMBER_INFO{} <- Nodes],
 
     %% Get the current list of planned changes and updated claim.
     Planned = case riak_control_session:get_plan() of
@@ -205,7 +201,7 @@ to_json(ReqData, Context) ->
         {ok, [], _Claim} ->
             [];
         {ok, Changes, Claim} ->
-            merge_transitions(Nodes, Changes, Claim)
+            merge_transitions(Nodes, Changes, Claim, Claimant)
     end,
 
     %% Generate a list of two clusters, current, and future with
@@ -215,13 +211,11 @@ to_json(ReqData, Context) ->
     {mochijson2:encode({struct,[{cluster,Clusters}]}), ReqData, Context}.
 
 %% @doc Generate a new "planned" cluster which outlines transitions.
--spec merge_transitions(list(member()), list(), list()) ->
+-spec merge_transitions(list(member()), list(), list(), node()) ->
     [{struct, list()}].
-merge_transitions(Nodes, Changes, Claim) ->
-    lists:foldl(fun(Node, TransitionedNodes) ->
-                ChangedNode = apply_changes(Node, Changes, Claim),
-                TransitionedNodes ++ [jsonify_node(ChangedNode)]
-        end, [], Nodes).
+merge_transitions(Nodes, Changes, Claim, Claimant) ->
+    [jsonify_node(apply_changes(Node, Changes, Claim), Claimant) ||
+        Node <- Nodes].
 
 %% @doc Merge change into member info record.
 -spec apply_changes(member(), list(), list()) -> member().
@@ -262,8 +256,8 @@ apply_claim_change(Node, Claim) ->
     end.
 
 %% @doc Turn a node into a proper struct for serialization.
--spec jsonify_node(member()) -> {struct, list()}.
-jsonify_node(Node) ->
+-spec jsonify_node(member(), node()) -> {struct, list()}.
+jsonify_node(Node, Claimant) ->
     LWM=app_helper:get_env(riak_control,low_mem_watermark,0.1),
     MemUsed = Node?MEMBER_INFO.mem_used,
     MemTotal = Node?MEMBER_INFO.mem_total,
@@ -279,6 +273,7 @@ jsonify_node(Node) ->
              {"mem_erlang",Node?MEMBER_INFO.mem_erlang},
              {"low_mem",LowMem},
              {"me",Node?MEMBER_INFO.node == node()},
+             {"claimant",Node?MEMBER_INFO.node == Claimant},
              {"action",Node?MEMBER_INFO.action},
              {"replacement",Node?MEMBER_INFO.replacement}]}.
 

@@ -13,6 +13,7 @@
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "port/port.h"
+#include "util/cache2.h"
 
 namespace leveldb {
 
@@ -62,6 +63,15 @@ class DBImpl : public DB {
   // file at a level >= 1.
   int64_t TEST_MaxNextLevelOverlappingBytes();
 
+  void ResizeCaches() {double_cache.ResizeCaches();};
+  size_t GetCacheCapacity() {return(double_cache.GetCapacity(false));}
+  void PurgeExpiredFileCache() {double_cache.PurgeExpiredFiles();};
+
+  void BackgroundCall2(Compaction * Compact);
+  void BackgroundImmCompactCall();
+  bool IsCompactionScheduled();
+  uint32_t RunningCompactionCount() {mutex_.AssertHeld(); return(running_compactions_);};
+
  private:
   friend class DB;
   struct CompactionState;
@@ -96,22 +106,26 @@ class DBImpl : public DB {
                         VersionEdit* edit,
                         SequenceNumber* max_sequence);
 
-  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base);
+  Status WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit, Version* base);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */);
   WriteBatch* BuildBatchGroup(Writer** last_writer);
 
   void MaybeScheduleCompaction();
-  static void BGWork(void* db);
-  void BackgroundCall();
-  Status BackgroundCompaction();
+
+  Status BackgroundCompaction(Compaction * Compact=NULL);
   void CleanupCompaction(CompactionState* compact);
   Status DoCompactionWork(CompactionState* compact);
   int64_t PrioritizeWork(bool IsLevel0);
 
-  Status OpenCompactionOutputFile(CompactionState* compact);
+  Status OpenCompactionOutputFile(CompactionState* compact, size_t sample_value_size);
+  bool Send2PageCache(CompactionState * compact);
+  size_t MaybeRaiseBlockSize(Compaction & CompactionStuff, size_t SampleValueSize);
   Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
   Status InstallCompactionResults(CompactionState* compact);
+
+  // initialized before options so its block_cache is available
+  class DoubleCache double_cache;
 
   // Constant after construction
   Env* const env_;
@@ -125,6 +139,7 @@ class DBImpl : public DB {
   // table_cache_ provides its own synchronization
   TableCache* table_cache_;
 
+
   // Lock over the persistent DB state.  Non-NULL iff successfully acquired.
   FileLock* db_lock_;
 
@@ -132,9 +147,10 @@ class DBImpl : public DB {
   port::Mutex mutex_;
   port::Mutex throttle_mutex_;   // used by write throttle to force sequential waits on callers
   port::AtomicPointer shutting_down_;
+
   port::CondVar bg_cv_;          // Signalled when background work finishes
   MemTable* mem_;
-  MemTable* imm_;                // Memtable being compacted
+  volatile MemTable* imm_;                // Memtable being compacted
   port::AtomicPointer has_imm_;  // So bg thread can detect non-NULL imm_
   WritableFile* logfile_;
   uint64_t logfile_number_;
@@ -161,7 +177,7 @@ class DBImpl : public DB {
     const InternalKey* end;     // NULL means end of key range
     InternalKey tmp_storage;    // Used to keep track of compaction progress
   };
-  ManualCompaction* manual_compaction_;
+  volatile ManualCompaction* manual_compaction_;
 
   VersionSet* versions_;
 
@@ -188,6 +204,16 @@ class DBImpl : public DB {
   // hint to background thread when level0 is backing up
   volatile bool level0_good;
 
+  volatile uint64_t throttle_end;
+  volatile uint32_t running_compactions_;
+  volatile size_t current_block_size_;    // last dynamic block size computed
+  volatile uint64_t block_size_changed_;  // NowMicros() when block size computed
+  volatile uint64_t last_low_mem_;        // NowMicros() when low memory last seen
+
+  // accessor to new, dynamic block_cache
+  Cache * block_cache() {return(double_cache.GetBlockCache());};
+  Cache * file_cache() {return(double_cache.GetFileCache());};
+
   // No copying allowed
   DBImpl(const DBImpl&);
   void operator=(const DBImpl&);
@@ -202,7 +228,8 @@ class DBImpl : public DB {
 extern Options SanitizeOptions(const std::string& db,
                                const InternalKeyComparator* icmp,
                                const InternalFilterPolicy* ipolicy,
-                               const Options& src);
+                               const Options& src,
+                               Cache * block_cache);
 
 }  // namespace leveldb
 

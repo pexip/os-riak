@@ -1,6 +1,6 @@
 %% @author Justin Sheehy <justin@basho.com>
 %% @author Andy Gross <andy@basho.com>
-%% @copyright 2007-2008 Basho Technologies
+%% @copyright 2007-2014 Basho Technologies
 %%
 %%    Licensed under the Apache License, Version 2.0 (the "License");
 %%    you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@
 start(Options) ->
     {DispatchList, PName, DGroup, WMOptions, OtherOptions} = get_wm_options(Options),
     webmachine_router:init_routes(DGroup, DispatchList),
-    [application_set_unless_env_or_undef(K, V) || {K, V} <- WMOptions],
+    _ = [application_set_unless_env_or_undef(K, V) || {K, V} <- WMOptions],
     MochiName = list_to_atom(to_list(PName) ++ "_mochiweb"),
     LoopFun = fun(X) -> loop(DGroup, X) end,
     mochiweb_http:start([{name, MochiName}, {loop, LoopFun} | OtherOptions]).
@@ -57,8 +57,6 @@ loop(Name, MochiReq) ->
 
     %% Run the dispatch code, catch any errors...
     try webmachine_dispatcher:dispatch(Host, Path, DispatchList, RD) of
-        {error, invalid_host} ->
-            handle_error(400, "Invalid Host", Req);
         {no_dispatch_match, _UnmatchedHost, _UnmatchedPathTokens} ->
             handle_error(404, {none, none, []}, Req);
         {Mod, ModOpts, HostTokens, Port, PathTokens, Bindings,

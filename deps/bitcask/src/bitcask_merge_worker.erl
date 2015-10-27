@@ -36,14 +36,15 @@
 
 %% API
 -export([start_link/0,
-         merge/1, merge/2, merge/3]).
+         merge/1, merge/2, merge/3,
+         status/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(state, { queue,
-                 worker}).
+-record(state, { queue :: list(),
+                worker :: undefined | pid()}).
 
 %% ====================================================================
 %% API
@@ -60,6 +61,9 @@ merge(Dir, Opts) ->
 
 merge(Dir, Opts, Files) ->
     gen_server:call(?MODULE, {merge, [Dir, Opts, Files]}, infinity).
+
+status() ->
+    gen_server:call(?MODULE, {status}, infinity).
 
 %% ====================================================================
 %% gen_server callbacks
@@ -114,7 +118,11 @@ handle_call({merge, Args0}, _From, #state { queue = Q } = State) ->
                 _ ->
                     {reply, ok, State#state { queue = Q ++ [Args] }}
             end
-    end.
+    end;
+handle_call({status}, _From, #state { queue = Q, worker = Worker } = State) ->
+    {reply, {length(Q), Worker}, State};
+handle_call(_, _From, State) ->
+    {reply, unknown_call, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -123,13 +131,12 @@ handle_cast(_Msg, State) ->
 handle_info({'EXIT', _Pid, normal}, #state { queue = Q } = State) ->
     case Q of
         [] ->
-            {noreply, State#state { worker = undefined },
-             hibernate};
+            {noreply, State#state { worker = undefined }};
         [Args0|Q2] ->
             Args = tuple_to_list(Args0),
             WorkerPid = spawn_link(fun() -> do_merge(Args) end),
             {noreply, State#state { queue = Q2,
-                                    worker = WorkerPid }, hibernate}
+                                    worker = WorkerPid }}
     end;
 
 handle_info({'EXIT', Pid, Reason}, #state { worker = Pid } = State) ->
@@ -246,8 +253,9 @@ prop_in_window() ->
                 true
             end).
 
-prop_in_window_test() ->
-    ?assert(eqc:quickcheck(prop_in_window())).
+prop_in_window_test_() ->
+    {timeout, 30,
+     [fun() -> ?assert(eqc:quickcheck(prop_in_window())) end]}.
 
 
 -endif.

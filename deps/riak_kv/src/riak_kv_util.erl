@@ -43,7 +43,11 @@
          puts_active/0,
          exact_puts_active/0,
          gets_active/0,
-         overload_reply/1]).
+         consistent_object/1,
+         get_write_once/1,
+         overload_reply/1,
+         get_backend_config/3,
+         is_modfun_allowed/2]).
 
 -include_lib("riak_kv_vnode.hrl").
 
@@ -129,11 +133,9 @@ make_request(Request, Index) ->
                                         Index).
 
 get_bucket_option(Type, BucketProps) ->
-    case proplists:get_value(Type, BucketProps, default) of
-        default ->
-            {ok, DefaultProps} = application:get_env(riak_core, default_bucket_props),
-            proplists:get_value(Type, DefaultProps, error);
-        Val -> Val
+    case lists:keyfind(Type, 1, BucketProps) of
+        {Type, Val} -> Val;
+        _ -> throw(unknown_bucket_option)
     end.
 
 expand_value(Type, default, BucketProps) ->
@@ -158,6 +160,24 @@ normalize_rw_value(one, _N) -> 1;
 normalize_rw_value(quorum, N) -> erlang:trunc((N/2)+1);
 normalize_rw_value(all, N) -> N;
 normalize_rw_value(_, _) -> error.
+
+-spec consistent_object(binary() | {binary(),binary()}) -> true | false | {error,_}.
+consistent_object(Bucket) ->
+    case riak_core_bucket:get_bucket(Bucket) of
+        Props when is_list(Props) ->
+            lists:member({consistent, true}, Props);
+        {error, _}=Err ->
+            Err
+    end.
+
+-spec get_write_once(binary() | {binary(),binary()}) -> true | false | {error,_}.
+get_write_once(Bucket) ->
+    case riak_core_bucket:get_bucket(Bucket) of
+        Props when is_list(Props) ->
+            lists:member({write_once, true}, Props);
+        {error, _}=Err ->
+            Err
+    end.
 
 %% ===================================================================
 %% Preflist utility functions
@@ -307,6 +327,9 @@ fix_incorrect_index_entry(Idx, ForUpgrade, BadKeys, {Success, Ignore, Error}) ->
 %% needs to take an acc to count success/error/ignore
 process_incorrect_index_entries(Ref, Idx, ForUpgrade, FixFun, {S, I, E} = Acc) ->
     receive
+        {Ref, {error, Reason}} ->
+            lager:error("index reformat: error on partition ~p: ~p", [Idx, Reason]),
+            {S, I, E+1};
         {Ref, ignore} ->
             lager:info("index reformat: ignoring partition ~p", [Idx]),
             ignore;
@@ -324,6 +347,11 @@ process_incorrect_index_entries(Ref, Idx, ForUpgrade, FixFun, {S, I, E} = Acc) -
             end,
             ack_incorrect_keys(Pid, BatchRef),
             process_incorrect_index_entries(Ref, Idx, ForUpgrade, FixFun, NextAcc)
+    after
+        120000 ->
+            lager:error("index reformat: timed out waiting for response from partition ~p",
+                        [Idx]),
+            {S, I, E+1}
     end.
 
 ack_incorrect_keys(Pid, Ref) ->
@@ -338,10 +366,18 @@ mark_indexes_reformatted(Idx, 0, ForUpgrade) ->
 mark_indexes_reformatted(_Idx, _ErrorCount, _ForUpgrade) ->
     undefined.
 
-%% @Doc vtag creation function
+-ifndef(old_hash).
+md5(Bin) ->
+    crypto:hash(md5, Bin).
+-else.
+md5(Bin) ->
+    crypto:md5(Bin).
+-endif.
+
+%% @doc vtag creation function
 -spec make_vtag(erlang:timestamp()) -> list().
 make_vtag(Now) ->
-    <<HashAsNum:128/integer>> = crypto:md5(term_to_binary({node(), Now})),
+    <<HashAsNum:128/integer>> = md5(term_to_binary({node(), Now})),
     riak_core_util:integer_to_list(HashAsNum,62).
 
 overload_reply({raw, ReqId, Pid}) ->
@@ -372,6 +408,55 @@ gets_active() ->
         _ ->
             sidejob_resource_stats:usage(riak_kv_get_fsm_sj)
     end.
+
+%% @doc Get backend config for backends without an associated application
+%% eg, yessir, memory
+get_backend_config(Key, Config, Category) ->
+    case proplists:get_value(Key, Config) of
+        undefined ->
+            case proplists:get_value(Category, Config) of
+                undefined ->
+                    undefined;
+                InnerConfig ->
+                    proplists:get_value(Key, InnerConfig)
+            end;
+        Val ->
+            Val
+    end.
+
+%% @doc Is the Module/Function from a mapreduce {modfun, ...} tuple allowed by
+%% the security rules? This is to help prevent against attacks like the one
+%% described in
+%% http://aphyr.com/posts/224-do-not-expose-riak-directly-to-the-internet
+%% by whitelisting the code path for 'allowed' mapreduce modules, which we
+%% assume the user has written securely.
+is_modfun_allowed(riak_kv_mapreduce, _) ->
+    %% these are common mapreduce helpers, provided by riak KV, we trust them
+    true;
+is_modfun_allowed(Mod, _Fun) ->
+    case riak_core_security:is_enabled() of
+        true ->
+            Paths = [filename:absname(N)
+                     || N <- app_helper:get_env(riak_kv, add_paths, [])],
+            case code:which(Mod) of
+                non_existing ->
+                    {error, {non_existing, Mod}};
+                Path when is_list(Path) ->
+                    %% ensure that the module is in one of the paths
+                    %% explicitly configured for third party code
+                    case lists:member(filename:dirname(Path), Paths) of
+                        true ->
+                            true;
+                        _ ->
+                            {error, {insecure_module_path, Path}}
+                    end;
+                Reason ->
+                    {error, {illegal_module, Mod, Reason}}
+            end;
+        _ ->
+            true
+    end.
+
 
 %% ===================================================================
 %% EUnit tests
