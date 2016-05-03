@@ -1,3 +1,9 @@
+riak (2.1.4-1) pexip; urgency=low
+
+  * New upstream release
+
+ -- John-Mark Bell <jmb@pexip.com>  Tue, 03 May 2016 19:16:25 +0100
+
 riak (2.1.1-1) pexip; urgency=low
 
   * New upstream release
