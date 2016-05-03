@@ -130,15 +130,18 @@ Options SanitizeOptions(const std::string& dbname,
   ClipToRange(&result.write_buffer_size,         64<<10, 1<<30);
   ClipToRange(&result.block_size,                1<<10,  4<<20);
 
-  if (src.limited_developer_mem)
-      gMapSize=2*1024*1024L;
-
   // alternate means to change gMapSize ... more generic
   if (0!=src.mmap_size)
       gMapSize=src.mmap_size;
 
-  if (gMapSize < result.write_buffer_size) // let unit tests be smaller
-      result.write_buffer_size=gMapSize;
+  // reduce buffer sizes if limited_developer_mem is true
+  if (src.limited_developer_mem)
+  {
+      if (0==src.mmap_size)
+          gMapSize=2*1024*1024L;
+      if (gMapSize < result.write_buffer_size) // let unit tests be smaller
+          result.write_buffer_size=gMapSize;
+  }   // if
 
   // Validate tiered storage options
   tiered_dbname=MakeTieredDbname(dbname, result);
@@ -189,7 +192,6 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
       block_size_changed_(0), last_low_mem_(0)
 {
   current_block_size_=options_.block_size;
-  DBList()->AddDB(this, options_.is_internal_db);
 
   mem_->Ref();
   has_imm_.Release_Store(NULL);
@@ -199,15 +201,17 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
   versions_ = new VersionSet(dbname_, &options_, table_cache_,
                              &internal_comparator_);
 
-  gFlexCache.SetTotalMemory(options_.total_leveldb_mem);
-
   // switch global for everyone ... tacky implementation for now
   gFadviseWillNeed=options_.fadvise_willneed;
+
+  // CAUTION: all object initialization must be completed
+  //          before the AddDB and SetTotalMemory calls.
+  DBList()->AddDB(this, options_.is_internal_db);
+  gFlexCache.SetTotalMemory(options_.total_leveldb_mem);
 
   options_.Dump(options_.info_log);
   Log(options_.info_log,"               File cache size: %zd", double_cache.GetCapacity(true));
   Log(options_.info_log,"              Block cache size: %zd", double_cache.GetCapacity(false));
-
 }
 
 DBImpl::~DBImpl() {
@@ -231,6 +235,10 @@ DBImpl::~DBImpl() {
   delete tmp_batch_;
   delete log_;
   delete logfile_;
+
+  if (options_.cache_object_warming)
+      table_cache_->SaveOpenFileList();
+
   delete table_cache_;
 
   if (owns_info_log_) {
@@ -712,14 +720,51 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
     if (base != NULL) {
-        level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
+        int level_limit;
+        if (0!=options_.tiered_slow_level && (options_.tiered_slow_level-1)<static_cast<unsigned>(config::kMaxMemCompactLevel))
+            level_limit=options_.tiered_slow_level-1;
+        else
+            level_limit=config::kMaxMemCompactLevel;
+
+        // remember, mutex is held so safe to push file into a non-compacting level
+        level = base->PickLevelForMemTableOutput(min_user_key, max_user_key, level_limit);
+        if (versions_->IsCompactionSubmitted(level) || !versions_->NeighborCompactionsQuiet(level))
+            level=0;
+
         if (0!=level)
         {
+            Status move_s;
             std::string old_name, new_name;
 
             old_name=TableFileName(options_, meta.number, 0);
             new_name=TableFileName(options_, meta.number, level);
-            s=env_->RenameFile(old_name, new_name);
+            move_s=env_->RenameFile(old_name, new_name);
+
+            if (move_s.ok())
+            {
+                // builder already added file to table_cache with 2 references and
+                //  marked as level 0 (used by cache warming) ... going to remove from cache
+                //  and add again correctly
+                table_cache_->Evict(meta.number, true);
+                meta.level=level;
+
+                // sadly, we must hold the mutex during this file open
+                //  since operating in non-overlapped level
+                Iterator* it=table_cache_->NewIterator(ReadOptions(),
+                                                       meta.number,
+                                                       meta.file_size,
+                                                       meta.level);
+                delete it;
+
+                // argh!  logging while holding mutex ... cannot release
+                Log(options_.info_log, "Level-0 table #%llu:  moved to level %d",
+                    (unsigned long long) meta.number,
+                    level);
+            }   // if
+            else
+            {
+                level=0;
+            }   // else
         }   // if
     }
 
@@ -733,23 +778,11 @@ Status DBImpl::WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit,
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
 
-  if (0!=meta.num_entries && s.ok())
-  {
-      // This SetWriteRate() call removed because this thread
-      //  has priority (others blocked on mutex) and thus created
-      //  misleading estimates of disk write speed
-      // 2x since mem to disk, not disk to disk
-      //      env_->SetWriteRate(2*stats.micros/meta.num_entries);
-      // 2x since mem to disk, not disk to disk
-      // env_->SetWriteRate(2*stats.micros/meta.num_entries);
-  }   // if
-
   // Riak adds extra reference to file, must remove it
   //  in this race condition upon close
   if (s.ok() && shutting_down_.Acquire_Load()) {
-      versions_->GetTableCache()->Evict(meta.number, true);
+      table_cache_->Evict(meta.number, versions_->IsLevelOverlapped(level));
   }
-
 
   return s;
 }
@@ -816,13 +849,13 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,const Slice* end) {
   if (begin == NULL) {
     manual.begin = NULL;
   } else {
-    begin_storage = InternalKey(*begin, kMaxSequenceNumber, kValueTypeForSeek);
+    begin_storage = InternalKey(*begin, 0, kMaxSequenceNumber, kValueTypeForSeek);
     manual.begin = &begin_storage;
   }
   if (end == NULL) {
     manual.end = NULL;
   } else {
-    end_storage = InternalKey(*end, 0, static_cast<ValueType>(0));
+    end_storage = InternalKey(*end, 0, 0, static_cast<ValueType>(0));
     manual.end = &end_storage;
   }
 
@@ -900,7 +933,7 @@ void DBImpl::BackgroundCall2(
 
   if (!shutting_down_.Acquire_Load()) {
     Status s = BackgroundCompaction(Compact);
-    if (!s.ok()) {
+    if (!s.ok() && !shutting_down_.Acquire_Load()) {
       // Wait a little bit before retrying background compaction in
       // case this is an environmental problem and we do not want to
       // chew up resources for failed compactions for the duration of
@@ -919,7 +952,7 @@ void DBImpl::BackgroundCall2(
   }   // else
   bg_compaction_scheduled_ = false;
   --running_compactions_;
-  versions_->SetCompactionDone(level);
+  versions_->SetCompactionDone(level, env_->NowMicros());
 
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
@@ -941,7 +974,7 @@ DBImpl::BackgroundImmCompactCall() {
 
   if (!shutting_down_.Acquire_Load()) {
     s = CompactMemTable();
-    if (!s.ok()) {
+    if (!s.ok() && !shutting_down_.Acquire_Load()) {
       // Wait a little bit before retrying background compaction in
       // case this is an environmental problem and we do not want to
       // chew up resources for failed compactions for the duration of
@@ -986,6 +1019,7 @@ DBImpl::BackgroundImmCompactCall() {
 Status DBImpl::BackgroundCompaction(
     Compaction * Compact) {
   Status status;
+  bool do_compact(true);
 
   mutex_.AssertHeld();
 
@@ -1014,7 +1048,9 @@ Status DBImpl::BackgroundCompaction(
 
   if (c == NULL) {
     // Nothing to do
-  } else if (!is_manual && c->IsTrivialMove()) {
+    do_compact=false;
+  } else if (!is_manual && c->IsTrivialMove()
+             && (c->level()+1)!=(int)options_.tiered_slow_level) {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     std::string old_name, new_name;
@@ -1026,10 +1062,13 @@ Status DBImpl::BackgroundCompaction(
 
     if (status.ok())
     {
+        gPerfCounters->Inc(ePerfBGMove);
+        do_compact=false;
         c->edit()->DeleteFile(c->level(), f->number);
         c->edit()->AddFile(c->level() + 1, f->number, f->file_size,
                            f->smallest, f->largest);
         status = versions_->LogAndApply(c->edit(), &mutex_);
+        DeleteObsoleteFiles();
 
         // if LogAndApply fails, should file be renamed back to original spot?
         VersionSet::LevelSummaryStorage tmp;
@@ -1039,8 +1078,19 @@ Status DBImpl::BackgroundCompaction(
             static_cast<unsigned long long>(f->file_size),
             status.ToString().c_str(),
             versions_->LevelSummary(&tmp));
+
+        // no time, no keys ... just make the call so that one compaction
+        //  gets posted against potential backlog ... extremely important
+        //  to write throttle logic.
+        SetThrottleWriteRate(0, 0, (0 == c->level()));
     }  // if
-  } else {
+    else {
+        // retry as compaction instead of move
+        do_compact=true; // redundant but safe
+        gPerfCounters->Inc(ePerfBGMoveFail);
+    }   // else
+  }
+  if (do_compact) {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
     CleanupCompaction(compact);
@@ -1149,7 +1199,6 @@ Status DBImpl::OpenCompactionOutputFile(
                   // did size change?
                   if (options.block_size!=old_size)
                   {
-                      gPerfCounters->Inc(ePerfDebug0);
                       block_size_changed_=now;
                   }   // if
               }   // if
@@ -1165,6 +1214,17 @@ Status DBImpl::OpenCompactionOutputFile(
           }   // else if
 
       }   // if
+
+      // force call to CalcInputState to set IsCompressible
+      compact->compaction->CalcInputStats(*table_cache_);
+
+      // do not attempt compression if data known to not compress
+      if (kSnappyCompression==options.compression && !compact->compaction->IsCompressible())
+      {
+          options.compression=kNoCompressionAutomated;
+          Log(options.info_log, "kNoCompressionAutomated");
+      }   // if
+
 
       // tune fadvise to keep as much of the file data in RAM as
       //  reasonably possible
@@ -1428,8 +1488,6 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   bool is_level0_compaction=(0 == compact->compaction->level());
 
   const uint64_t start_micros = env_->NowMicros();
-  int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
-
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
   input->SeekToFirst();
@@ -1503,7 +1561,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   input = NULL;
 
   CompactionStats stats;
-  stats.micros = env_->NowMicros() - start_micros - imm_micros;
+  stats.micros = env_->NowMicros() - start_micros;
   for (int which = 0; which < 2; which++) {
     for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
       stats.bytes_read += compact->compaction->input(which, i)->file_size;
@@ -1523,8 +1581,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
   if (status.ok()) {
     if (0!=compact->num_entries)
-        SetThrottleWriteRate((env_->NowMicros() - start_micros - imm_micros), compact->num_entries,
-                            is_level0_compaction, env_->GetBackgroundBacklog());
+        SetThrottleWriteRate((env_->NowMicros() - start_micros),
+                             compact->num_entries, is_level0_compaction);
     status = InstallCompactionResults(compact);
   }
 
@@ -1812,7 +1870,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
 
 // REQUIRES: Writer list must be non-empty
 // REQUIRES: First writer must have a non-NULL batch
+// REQUIRES: mutex_ is held
 WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
+  mutex_.AssertHeld();
   assert(!writers_.empty());
   Writer* first = writers_.front();
   WriteBatch* result = first->batch;
@@ -1887,6 +1947,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // case it is sharing the same core as the writer.
       mutex_.Unlock();
 #if 0   // see if this impacts smoothing or helps (but keep the counts)
+      // (original Google code left for reference)
       env_->SleepForMicroseconds(1000);
 #endif
       allow_delay = false;  // Do not delay a single write more than once
@@ -1919,20 +1980,15 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       assert(versions_->PrevLogNumber() == 0);
       uint64_t new_log_number = versions_->NewFileNumber();
 
-      WritableFile* lfile = NULL;
       gPerfCounters->Inc(ePerfWriteNewMem);
-      s = env_->NewWriteOnlyFile(LogFileName(dbname_, new_log_number), &lfile,
-                                 options_.env->RecoveryMmapSize(&options_));
+      s = NewRecoveryLog(new_log_number);
+
       if (!s.ok()) {
         // Avoid chewing through file number space in a tight loop.
         versions_->ReuseFileNumber(new_log_number);
         break;
       }
-      delete log_;
-      delete logfile_;
-      logfile_ = lfile;
-      logfile_number_ = new_log_number;
-      log_ = new log::Writer(lfile);
+
       imm_ = mem_;
       has_imm_.Release_Store((MemTable*)imm_);
       if (NULL!=imm_)
@@ -1948,6 +2004,34 @@ Status DBImpl::MakeRoomForWrite(bool force) {
   }
   return s;
 }
+
+// the following steps existed in two places, DB::Open() and
+//  DBImpl::MakeRoomForWrite().  This lead to a bug in Basho's
+//  tiered storage feature.  Unifying the code.
+Status DBImpl::NewRecoveryLog(
+    uint64_t NewLogNumber)
+{
+    mutex_.AssertHeld();
+    Status s;
+    WritableFile * lfile(NULL);
+
+    s = env_->NewWriteOnlyFile(LogFileName(dbname_, NewLogNumber), &lfile,
+                               options_.env->RecoveryMmapSize(&options_));
+    if (s.ok())
+    {
+        // close any existing
+        delete log_;
+        delete logfile_;
+
+        logfile_ = lfile;
+        logfile_number_ = NewLogNumber;
+        log_ = new log::Writer(lfile);
+    }   // if
+
+    return(s);
+
+}   // DBImpl::NewRecoveryLog
+
 
 bool DBImpl::GetProperty(const Slice& property, std::string* value) {
   value->clear();
@@ -2044,8 +2128,8 @@ void DBImpl::GetApproximateSizes(
 
   for (int i = 0; i < n; i++) {
     // Convert user_key into a corresponding internal key.
-    InternalKey k1(range[i].start, kMaxSequenceNumber, kValueTypeForSeek);
-    InternalKey k2(range[i].limit, kMaxSequenceNumber, kValueTypeForSeek);
+    InternalKey k1(range[i].start, 0, kMaxSequenceNumber, kValueTypeForSeek);
+    InternalKey k2(range[i].limit, 0, kMaxSequenceNumber, kValueTypeForSeek);
     uint64_t start = versions_->ApproximateOffsetOf(v, k1);
     uint64_t limit = versions_->ApproximateOffsetOf(v, k2);
     sizes[i] = (limit >= start ? limit - start : 0);
@@ -2087,6 +2171,9 @@ Status DB::Open(const Options& options, const std::string& dbname,
   VersionEdit edit;
   Status s;
 
+  // WARNING:  only use impl and impl->options_ from this point.
+  //           Things like tiered storage change the meanings
+
   // 4 level0 files at 2Mbytes and 2Mbytes of block cache
   //  (but first level1 file is likely to thrash)
   //  ... this value is AFTER write_buffer and 40M for recovery log and LOG
@@ -2098,14 +2185,11 @@ Status DB::Open(const Options& options, const std::string& dbname,
 
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
-    WritableFile* lfile;
-    s = options.env->NewWriteOnlyFile(LogFileName(dbname, new_log_number),
-                                      &lfile, options.env->RecoveryMmapSize(&options));
+
+    s = impl->NewRecoveryLog(new_log_number);
+
     if (s.ok()) {
       edit.SetLogNumber(new_log_number);
-      impl->logfile_ = lfile;
-      impl->logfile_number_ = new_log_number;
-      impl->log_ = new log::Writer(lfile);
       s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
     }
     if (s.ok()) {
@@ -2113,6 +2197,10 @@ Status DB::Open(const Options& options, const std::string& dbname,
       impl->CheckCompactionState();
     }
   }
+
+  if (impl->options_.cache_object_warming)
+      impl->table_cache_->PreloadTableCache();
+
   impl->mutex_.Unlock();
   if (s.ok()) {
     *dbptr = impl;
@@ -2242,6 +2330,19 @@ DBImpl::VerifyLevels()
     return(result);
 
 }   // VerifyLevels
+
+void DB::CheckAvailableCompactions() {return;};
+
+// Used internally for inter-database notification
+//  of potential grooming timeslot availability.
+void
+DBImpl::CheckAvailableCompactions()
+{
+    MutexLock l(&mutex_);
+    MaybeScheduleCompaction();
+
+    return;
+}   // CheckAvailableCompactions
 
 
 bool

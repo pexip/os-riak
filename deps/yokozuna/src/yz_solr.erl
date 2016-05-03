@@ -29,11 +29,12 @@
 -define(CORE_ALIASES, [{index_dir, instanceDir},
                        {cfg_file, config},
                        {schema_file, schema},
-                       {delete_instance, deleteInstanceDir}]).
+                       {delete_instance, deleteInstanceDir},
+                       {delete_index, deleteIndex},
+                       {delete_data_dir, deleteDataDir}]).
 -define(FIELD_ALIASES, [{continuation, continue},
-                        {limit,n}]).
+                        {limit, n}]).
 -define(QUERY(Bin), {struct, [{'query', Bin}]}).
--define(SOLR_TIMEOUT, 60000).
 
 -type delete_op() :: {id, binary()}
                    | {bkey, bkey()}
@@ -70,7 +71,8 @@ commit(Core) ->
     URL = ?FMT("~s/~s/update?~s", [base_url(), Core, Encoded]),
     Headers = [{content_type, "application/json"}],
     Opts = [{response_format, binary}],
-    case ibrowse:send_req(URL, Headers, post, JSON, Opts, ?SOLR_TIMEOUT) of
+    case ibrowse:send_req(URL, Headers, post, JSON, Opts,
+                          ?YZ_SOLR_REQUEST_TIMEOUT) of
         {ok, "200", _, _} -> ok;
         Err -> throw({"Failed to commit", Err})
     end.
@@ -79,7 +81,7 @@ commit(Core) ->
 -spec core(atom(), proplist()) -> {ok, list(), binary()} |
                                   {error, term()}.
 core(Action, Props) ->
-    core(Action, Props, ?SOLR_TIMEOUT).
+    core(Action, Props, ?YZ_SOLR_REQUEST_TIMEOUT).
 
 -spec core(atom(), proplist(), ms()) -> {ok, list(), binary()} |
                                         {error, term()}.
@@ -135,7 +137,8 @@ delete(Index, Ops) ->
     URL = ?FMT("~s/~s/update", [base_url(), Index]),
     Headers = [{content_type, "application/json"}],
     Opts = [{response_format, binary}],
-    case ibrowse:send_req(URL, Headers, post, JSON, Opts, ?SOLR_TIMEOUT) of
+    case ibrowse:send_req(URL, Headers, post, JSON, Opts,
+                          ?YZ_SOLR_REQUEST_TIMEOUT) of
         {ok, "200", _, _} -> ok;
         Err -> {error, Err}
     end.
@@ -170,7 +173,7 @@ entropy_data(Core, Filter) ->
     Opts = [{response_format, binary}],
     URL = ?FMT("~s/~s/entropy_data?~s",
                [base_url(), Core, mochiweb_util:urlencode(Params2)]),
-    case ibrowse:send_req(URL, [], get, [], Opts) of
+    case ibrowse:send_req(URL, [], get, [], Opts, ?YZ_SOLR_REQUEST_TIMEOUT) of
         {ok, "200", _Headers, Body} ->
             R = mochijson2:decode(Body),
             More = kvc:path([<<"more">>], R),
@@ -194,9 +197,12 @@ index(Core, Docs, DelOps) ->
     URL = ?FMT("~s/~s/update", [base_url(), Core]),
     Headers = [{content_type, "application/json"}],
     Opts = [{response_format, binary}],
-    case ibrowse:send_req(URL, Headers, post, JSON, Opts, ?SOLR_TIMEOUT) of
+    case ibrowse:send_req(URL, Headers, post, JSON, Opts,
+                          ?YZ_SOLR_REQUEST_TIMEOUT) of
         {ok, "200", _, _} -> ok;
-        Err -> throw({"Failed to index docs", Err})
+        {ok, "400", _, ErrBody} -> throw({"Failed to index docs", badrequest,
+                                         ErrBody});
+        Err -> throw({"Failed to index docs", other, Err})
     end.
 
 %% @doc Determine if Solr is running.
@@ -234,18 +240,19 @@ partition_list(Core) ->
     Encoded = mochiweb_util:urlencode(Params),
     URL = ?FMT("~s/~s/select?~s", [base_url(), Core, Encoded]),
     Opts = [{response_format, binary}],
-    case ibrowse:send_req(URL, [], get, [], Opts, ?SOLR_TIMEOUT) of
+    case ibrowse:send_req(URL, [], get, [], Opts, ?YZ_SOLR_REQUEST_TIMEOUT) of
         {ok, "200", _, Resp} -> {ok, Resp};
         Err -> {error, Err}
     end.
 
 %% @doc Return boolean based on ping response from Solr.
--spec ping(index_name()) -> boolean().
+-spec ping(index_name()) -> boolean()|error.
 ping(Core) ->
     URL = ?FMT("~s/~s/admin/ping", [base_url(), Core]),
-    case ibrowse:send_req(URL, [], get) of
+    case ibrowse:send_req(URL, [], head) of
         {ok, "200", _, _} -> true;
-        _ -> false
+        {ok, "404", _, _} -> false;
+        _ -> error
     end.
 
 -spec port() -> non_neg_integer().
@@ -277,7 +284,8 @@ search(Core, Headers, Params) ->
     URL = ?FMT("~s/~s/select", [base_url(), Core]),
     Headers2 = [{content_type, "application/x-www-form-urlencoded"}|Headers],
     Opts = [{response_format, binary}],
-    case ibrowse:send_req(URL, Headers2, post, Body, Opts, ?SOLR_TIMEOUT) of
+    case ibrowse:send_req(URL, Headers2, post, Body, Opts,
+                          ?YZ_SOLR_REQUEST_TIMEOUT) of
         {ok, "200", RHeaders, Resp} -> {RHeaders, Resp};
         {ok, CodeStr, _, Err} ->
             {Code, _} = string:to_integer(CodeStr),
@@ -417,6 +425,10 @@ get_pairs(R) ->
     Docs = kvc:path([<<"response">>, <<"docs">>], R),
     [to_pair(DocStruct) || DocStruct <- Docs].
 
+%% @doc Convert a doc struct into a pair. Remove the bucket_type to match
+%% kv trees when iterating over entropy data to build yz trees.
+to_pair({struct, [{_,_Vsn},{_,<<"default">>},{_,BName},{_,Key},{_,Base64Hash}]}) ->
+    {{BName,Key}, base64:decode(Base64Hash)};
 to_pair({struct, [{_,_Vsn},{_,BType},{_,BName},{_,Key},{_,Base64Hash}]}) ->
     {{{BType, BName},Key}, base64:decode(Base64Hash)}.
 

@@ -86,6 +86,7 @@
                 time_ref :: ets:tid(),
                 max_memory :: undefined | integer(),
                 used_memory=0 :: integer(),
+                put_obj_size=0 :: integer(),
                 ttl :: integer()}).
 
 -type state() :: #state{}.
@@ -241,7 +242,8 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, State=#state{data_ref=DataRef,
             UsedMemory + Size - Freed
     end,
     UsedMemory2 = UsedMemory1 - OldSize,
-    {ok, State#state{used_memory=UsedMemory2}}.
+    {ok, State#state{used_memory=UsedMemory2,
+                     put_obj_size=Size}}.
 
 %% @doc Delete an object from the memory backend
 -spec delete(riak_object:bucket(), riak_object:key(), [index_spec()], state()) ->
@@ -269,7 +271,7 @@ delete(Bucket, Key, IndexSpecs, State=#state{data_ref=DataRef,
             UsedMemory1 = UsedMemory - object_size(Object),
             update_indexes(Bucket, Key, IndexSpecs, IndexRef),
             ets:delete(DataRef, {Bucket, Key});
-        [] -> 
+        [] ->
             UsedMemory1 = UsedMemory
     end,
     {ok, State#state{used_memory=UsedMemory1}}.
@@ -388,18 +390,24 @@ is_empty(#state{data_ref=DataRef}) ->
 -spec status(state()) -> [{atom(), term()}].
 status(#state{data_ref=DataRef,
               index_ref=IndexRef,
-              time_ref=TimeRef}) ->
+              time_ref=TimeRef,
+              used_memory=Memory,
+              put_obj_size=PutObjSize}) ->
     DataStatus = ets:info(DataRef),
     IndexStatus = ets:info(IndexRef),
     case TimeRef of
         undefined ->
             [{data_table_status, DataStatus},
-             {index_table_status, IndexStatus}];
+             {index_table_status, IndexStatus},
+             {used_memory, Memory},
+             {put_obj_size, PutObjSize}];
         _ ->
             TimeStatus = ets:info(TimeRef),
             [{data_table_status, DataStatus},
              {index_table_status, IndexStatus},
-             {time_table_status, TimeStatus}]
+             {time_table_status, TimeStatus},
+             {used_memory, Memory},
+             {put_obj_size, PutObjSize}]
     end.
 
 %% @doc Get the size of the memory backend. Returns a dynamic size
@@ -578,12 +586,8 @@ key_range_folder(Folder, Acc0, DataRef, {B, _K}=DataKey, {B, Q}) ->
             case riak_index:object_key_in_range(DataKey, B, Q) of
                 {true, DataKey} ->
                     %% add value to acc
-                    try
-                        Acc = Folder(Obj, Acc0),
-                        key_range_folder(Folder, Acc, DataRef, ets:next(DataRef, DataKey), {B, Q})
-                    catch stop_fold ->
-                            Acc0
-                    end;
+                    Acc = Folder(Obj, Acc0),
+                    key_range_folder(Folder, Acc, DataRef, ets:next(DataRef, DataKey), {B, Q});
                 {skip, DataKey} ->
                     key_range_folder(Folder, Acc0, DataRef, ets:next(DataRef, DataKey), {B, Q});
                 false -> Acc0
@@ -594,7 +598,7 @@ key_range_folder(_Folder, Acc, _DataRef, _DataKey, _Query) ->
 
 %% Iterates over a range of index postings
 index_range_folder(Folder, Acc0, IndexRef, {B, I, V, _K}=IndexKey,
-                   {QueryB, QueryI, Min, Max, StartKey, Incl}=Query) 
+                   {QueryB, QueryI, Min, Max, StartKey, Incl}=Query)
   when ((QueryB =:= undefined) orelse (QueryB =:= B)),
        ((QueryI =:= undefined) orelse (QueryI =:= I)),
        ((Min =:= undefined) orelse (V >= Min)),
@@ -609,12 +613,8 @@ index_range_folder(Folder, Acc0, IndexRef, {B, I, V, _K}=IndexKey,
             %% Exclude start {val,key} from results
             index_range_folder(Folder, Acc0, IndexRef, ets:next(IndexRef, IndexKey), Query);
         {_, [Posting]} ->
-            try
-                Acc = Folder(Posting, Acc0),
-                index_range_folder(Folder, Acc, IndexRef, ets:next(IndexRef, IndexKey), Query)
-            catch stop_fold ->
-                    Acc0
-            end
+            Acc = Folder(Posting, Acc0),
+            index_range_folder(Folder, Acc, IndexRef, ets:next(IndexRef, IndexKey), Query)
     end;
 index_range_folder(_Folder, Acc, _IndexRef, _IndexKey, _Query) ->
     Acc.
@@ -707,7 +707,7 @@ object_size(Object) ->
 
 simple_test_() ->
     Config = [{test, true}, {test_table_opts, [public]}],
-    riak_kv_backend:standard_test(?MODULE, Config).
+    backend_test_util:standard_test(?MODULE, Config).
 
 ttl_test_() ->
     Config = [{ttl, 15}],
@@ -717,9 +717,12 @@ ttl_test_() ->
     Key = <<"Key">>,
     Value = <<"Value">>,
 
+
+    %% Put an object, but ignore its put_obj_size
+    {ok, State1} = put(Bucket, Key, [], Value, State),
+    State2 = State1#state{put_obj_size=0},
     [
-     %% Put an object
-     ?_assertEqual({ok, State}, put(Bucket, Key, [], Value, State)),
+     ?_assertEqual(State, State2),
      %% Wait 1 second to access it
      ?_assertEqual(ok, timer:sleep(1000)),
      ?_assertEqual({ok, Value, State}, get(Bucket, Key, State)),

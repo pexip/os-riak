@@ -324,7 +324,7 @@ class DBTest {
 
   std::string AllEntriesFor(const Slice& user_key) {
     Iterator* iter = dbfull()->TEST_NewInternalIterator();
-    InternalKey target(user_key, kMaxSequenceNumber, kTypeValue);
+    InternalKey target(user_key, 0, kMaxSequenceNumber, kTypeValue);
     iter->Seek(target.Encode());
     std::string result;
     if (!iter->status().ok()) {
@@ -345,6 +345,8 @@ class DBTest {
           }
           first = false;
           switch (ikey.type) {
+            case kTypeValueWriteTime:
+            case kTypeValueExplicitExpiry:
             case kTypeValue:
               result += iter->value().ToString();
               break;
@@ -961,7 +963,8 @@ TEST(DBTest, RepeatedWritesToSameKey) {
 
   // We must have at most one file per level except for level-0,
   // which may have up to kL0_StopWritesTrigger files.
-  const int kMaxFiles = config::kNumLevels + config::kL0_StopWritesTrigger;
+  //  ... basho adds *2 since level-1 is now overlapped too
+  const int kMaxFiles = config::kNumLevels + config::kL0_StopWritesTrigger*2;
 
   Random rnd(301);
   std::string value = RandomString(&rnd, 2 * options.write_buffer_size);
@@ -1199,26 +1202,27 @@ TEST(DBTest, DeletionMarkers1) {
   Put("foo", "v1");
   ASSERT_OK(dbfull()->TEST_CompactMemTable());
   const int last = config::kMaxMemCompactLevel;
-  //ASSERT_EQ(NumTableFilesAtLevel(last), 1);   // foo => v1 is now in last level
+  ASSERT_EQ(NumTableFilesAtLevel(last), 1);   // foo => v1 is now in last level
 
   // Place a table at level last-1 to prevent merging with preceding mutation
   Put("a", "begin");
   Put("z", "end");
   dbfull()->TEST_CompactMemTable();
-  //ASSERT_EQ(NumTableFilesAtLevel(last), 1);
-  //ASSERT_EQ(NumTableFilesAtLevel(last-1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(last), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(last-1), 1);
 
   Delete("foo");
   Put("foo", "v2");
   ASSERT_EQ(AllEntriesFor("foo"), "[ v2, DEL, v1 ]");
-  ASSERT_OK(dbfull()->TEST_CompactMemTable());  // Moves to level last-2
+  ASSERT_OK(dbfull()->TEST_CompactMemTable());  // stays at level 0
   ASSERT_EQ(AllEntriesFor("foo"), "[ v2, v1 ]"); // riak 1.3, DEL merged out by BuildTable
   Slice z("z");
-  dbfull()->TEST_CompactRange(last-2, NULL, &z);
+  dbfull()->TEST_CompactRange(0, NULL, &z);
+  dbfull()->TEST_CompactRange(1, NULL, &z);
   // DEL eliminated, but v1 remains because we aren't compacting that level
   // (DEL can be eliminated because v2 hides v1).
-  //ASSERT_EQ(AllEntriesFor("foo"), "[ v2, v1 ]"); Riak 1.4 has merged to level 1
-  //dbfull()->TEST_CompactRange(last-1, NULL, NULL);
+  ASSERT_EQ(AllEntriesFor("foo"), "[ v2, v1 ]"); // Riak 1.4 has merged to level 1
+  dbfull()->TEST_CompactRange(last-1, NULL, NULL);
   // Merging last-1 w/ last, so we are the base level for "foo", so
   // DEL is removed.  (as is v1).
   ASSERT_EQ(AllEntriesFor("foo"), "[ v2 ]");
@@ -1228,20 +1232,20 @@ TEST(DBTest, DeletionMarkers2) {
   Put("foo", "v1");
   ASSERT_OK(dbfull()->TEST_CompactMemTable());
   const int last = config::kMaxMemCompactLevel;
-  ASSERT_EQ(NumTableFilesAtLevel(0), 1);   // foo => v1 is now in last level
+  ASSERT_EQ(NumTableFilesAtLevel(last), 1);   // foo => v1 is now in last level
   dbfull()->TEST_CompactRange(0, NULL, NULL);
-  ASSERT_EQ(NumTableFilesAtLevel(1), 1);   // foo => v1 is now in last level
-  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(last), 1);   // foo => v1 is now in last level
+  ASSERT_EQ(NumTableFilesAtLevel(last-1), 0);
 
   // Place a table at level last-1 to prevent merging with preceding mutation
   Put("a", "begin");
   Put("z", "end");
-  dbfull()->TEST_CompactMemTable();
-  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  dbfull()->TEST_CompactMemTable(); // goes to last-1
+  ASSERT_EQ(NumTableFilesAtLevel(last-1), 1);
 
   Delete("foo");
   ASSERT_EQ(AllEntriesFor("foo"), "[ DEL, v1 ]");
-  ASSERT_OK(dbfull()->TEST_CompactMemTable());  // Moves to level last-2
+  ASSERT_OK(dbfull()->TEST_CompactMemTable());  // Moves to level 0
   ASSERT_EQ(AllEntriesFor("foo"), "[ DEL, v1 ]");
   dbfull()->TEST_CompactRange(0, NULL, NULL);   // Riak overlaps level 1
   // DEL kept: "last" file overlaps
@@ -1249,7 +1253,7 @@ TEST(DBTest, DeletionMarkers2) {
   // Merging last-1 w/ last, so we are the base level for "foo", so
   // DEL is removed.  (as is v1).
   dbfull()->TEST_CompactRange(1, NULL, NULL);
-  ASSERT_EQ(AllEntriesFor("foo"), "[ DEL ]");
+  ASSERT_EQ(AllEntriesFor("foo"), "[ DEL, v1 ]");
 
   dbfull()->TEST_CompactRange(2, NULL, NULL);
   ASSERT_EQ(AllEntriesFor("foo"), "[ ]");
@@ -1257,7 +1261,7 @@ TEST(DBTest, DeletionMarkers2) {
 
 TEST(DBTest, OverlapInLevel0) {
   do {
-    ASSERT_EQ(config::kMaxMemCompactLevel, 2) << "Fix test to match config";
+    ASSERT_EQ(config::kMaxMemCompactLevel, 3) << "Fix test to match config";
 
     // Fill levels 1 and 2 to disable the pushing of new memtables to levels > 0.
     ASSERT_OK(Put("100", "v100"));
@@ -1269,7 +1273,7 @@ TEST(DBTest, OverlapInLevel0) {
     ASSERT_OK(Delete("999"));
     dbfull()->TEST_CompactMemTable();
     dbfull()->TEST_CompactRange(0, NULL, NULL);
-    ASSERT_EQ("0,1,1", FilesPerLevel());
+    ASSERT_EQ("0,0,1,1", FilesPerLevel());
 
     // Make files spanning the following ranges in level-0:
     //  files[0]  200 .. 900
@@ -1282,7 +1286,7 @@ TEST(DBTest, OverlapInLevel0) {
     ASSERT_OK(Put("600", "v600"));
     ASSERT_OK(Put("900", "v900"));
     dbfull()->TEST_CompactMemTable();
-    ASSERT_EQ("2,1,1", FilesPerLevel());
+    ASSERT_EQ("2,0,1,1", FilesPerLevel());
 
     // Compact away the placeholder files we created initially
     dbfull()->TEST_CompactRange(1, NULL, NULL);
@@ -1421,37 +1425,37 @@ TEST(DBTest, CustomComparator) {
 }
 
 TEST(DBTest, ManualCompaction) {
-  ASSERT_EQ(config::kMaxMemCompactLevel, 2)
+  ASSERT_EQ(config::kMaxMemCompactLevel, 3)
       << "Need to update this test to match kMaxMemCompactLevel";
 
   MakeTables(3, "p", "q");
-  ASSERT_EQ("3", FilesPerLevel());
+  ASSERT_EQ("1,0,1,1", FilesPerLevel());
 
   // Compaction range falls before files
   Compact("", "c");
-  ASSERT_EQ("3", FilesPerLevel());
+  ASSERT_EQ("0,1,1,1", FilesPerLevel());
 
   // Compaction range falls after files
   Compact("r", "z");
-  ASSERT_EQ("3", FilesPerLevel());
+  ASSERT_EQ("0,1,1,1", FilesPerLevel());
 
   // Compaction range overlaps files
   Compact("p1", "p9");
-  ASSERT_EQ("0,1", FilesPerLevel());
+  ASSERT_EQ("0,0,0,1", FilesPerLevel());
 
   // Populate a different range
   MakeTables(3, "c", "e");
-  ASSERT_EQ("3,1", FilesPerLevel());
+  ASSERT_EQ("1,0,1,2", FilesPerLevel());
 
   // Compact just the new range
   Compact("b", "f");
-  ASSERT_EQ("0,2", FilesPerLevel());
+  ASSERT_EQ("0,0,0,2", FilesPerLevel());
 
   // Compact all
   MakeTables(1, "a", "z");
-  ASSERT_EQ("1,2", FilesPerLevel());
+  ASSERT_EQ("0,0,1,2", FilesPerLevel());
   db_->CompactRange(NULL, NULL);
-  ASSERT_EQ("0,3", FilesPerLevel());
+  ASSERT_EQ("0,0,0,1", FilesPerLevel());
 }
 
 TEST(DBTest, DBOpen_Options) {
@@ -1932,6 +1936,44 @@ TEST(DBTest, Randomized) {
   } while (ChangeOptions());
 }
 
+
+class SimpleBugs
+{
+    // need a class for the test harness
+};
+
+
+TEST(SimpleBugs, TieredRecoveryLog)
+{
+    // DB::Open created first recovery log directly
+    //   which lead to it NOT being in tiered storage location.
+    // nope std::string dbname = test::TmpDir() + "/leveldb_nontiered";
+    std::string dbname = "leveldb";
+    std::string fastname = test::TmpDir() + "/leveldb_fast";
+    std::string slowname = test::TmpDir() + "/leveldb_slow";
+    std::string combined;
+
+    DB* db = NULL;
+    Options opts;
+
+    opts.tiered_slow_level = 4;
+    opts.tiered_fast_prefix = fastname;
+    opts.tiered_slow_prefix = slowname;
+    opts.create_if_missing = true;
+
+    Env::Default()->CreateDir(fastname);
+    Env::Default()->CreateDir(slowname);
+
+    Status s = DB::Open(opts, dbname, &db);
+    ASSERT_OK(s);
+    ASSERT_TRUE(db != NULL);
+
+    delete db;
+    DestroyDB(dbname, opts);
+
+}   // TieredRecoveryLog
+
+
 std::string MakeKey(unsigned int num) {
   char buf[30];
   snprintf(buf, sizeof(buf), "%016u", num);
@@ -1964,8 +2006,8 @@ void BM_LogAndApply(int iters, int num_base_files) {
   VersionEdit vbase;
   uint64_t fnum = 1;
   for (int i = 0; i < num_base_files; i++) {
-    InternalKey start(MakeKey(2*fnum), 1, kTypeValue);
-    InternalKey limit(MakeKey(2*fnum+1), 1, kTypeDeletion);
+    InternalKey start(MakeKey(2*fnum), 0, 1, kTypeValue);
+    InternalKey limit(MakeKey(2*fnum+1), 0, 1, kTypeDeletion);
     vbase.AddFile(2, fnum++, 1 /* file size */, start, limit);
   }
   ASSERT_OK(vset.LogAndApply(&vbase, &mu));
@@ -1975,8 +2017,8 @@ void BM_LogAndApply(int iters, int num_base_files) {
   for (int i = 0; i < iters; i++) {
     VersionEdit vedit;
     vedit.DeleteFile(2, fnum);
-    InternalKey start(MakeKey(2*fnum), 1, kTypeValue);
-    InternalKey limit(MakeKey(2*fnum+1), 1, kTypeDeletion);
+    InternalKey start(MakeKey(2*fnum), 0, 1, kTypeValue);
+    InternalKey limit(MakeKey(2*fnum+1), 0, 1, kTypeDeletion);
     vedit.AddFile(2, fnum++, 1 /* file size */, start, limit);
     vset.LogAndApply(&vedit, &mu);
   }

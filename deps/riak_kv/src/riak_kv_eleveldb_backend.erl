@@ -259,9 +259,9 @@ fix_index(IndexKey, ForUpgrade, #state{ref=Ref,
 fix_index(IndexKey, ForUpgrade, Ref, ReadOpts, WriteOpts) ->
     case eleveldb:get(Ref, IndexKey, ReadOpts) of
         {ok, _} ->
-            case from_index_key(IndexKey) of 
+            case from_index_key(IndexKey) of
                 {Bucket, Key, Field, Value} ->
-                    
+
                     NewKey = case ForUpgrade of
                                  true -> to_index_key(Bucket, Key, Field, Value);
                                  false -> to_legacy_index_key(Bucket, Key, Field, Value)
@@ -710,12 +710,12 @@ fold_keys_fun(FoldKeysFun, {index, FilterBucket,
             fun(Bucket, Key, Acc) ->
                     case re:run(Key, TermRe) of
                         nomatch -> Acc;
-                        _ -> stoppable_fold(FoldKeysFun, Bucket, Key, Acc)
+                        _ -> FoldKeysFun(Bucket, Key, Acc)
                     end
             end;
         false ->
             fun(Bucket, Key, Acc) ->
-                    stoppable_fold(FoldKeysFun, Bucket, Key, Acc)
+                    FoldKeysFun(Bucket, Key, Acc)
             end
     end,
 
@@ -736,7 +736,7 @@ fold_keys_fun(FoldKeysFun, {index, FilterBucket, Q=?KV_INDEX_Q{return_terms=Term
     AccFun = case TermRe =:= undefined of
         true ->
             fun(Bucket, _Term, Val, Acc) ->
-                    stoppable_fold(FoldKeysFun, Bucket, Val, Acc)
+                    FoldKeysFun(Bucket, Val, Acc)
             end;
         false ->
             fun(Bucket, Term, Val, Acc) ->
@@ -744,7 +744,7 @@ fold_keys_fun(FoldKeysFun, {index, FilterBucket, Q=?KV_INDEX_Q{return_terms=Term
                         nomatch ->
                             Acc;
                         _ ->
-                            stoppable_fold(FoldKeysFun, Bucket, Val, Acc)
+                            FoldKeysFun(Bucket, Val, Acc)
                     end
             end
     end,
@@ -803,18 +803,6 @@ fold_keys_fun(FoldKeysFun, {index, Bucket, V1Q}) ->
     fold_keys_fun(FoldKeysFun, {index, Bucket, Q}).
 
 %% @private
-%% To stop a fold in progress when pagination limit is reached.
-stoppable_fold(Fun, Bucket, Item, Acc) ->
-    try
-        Fun(Bucket, Item, Acc)
-    catch
-        stop_fold ->
-            throw({break, Acc})
-    end.
-
-
-
-%% @private
 %% Return a function to fold over the objects on this backend
 fold_objects_fun(FoldObjectsFun, {index, FilterBucket, Q=?KV_INDEX_Q{}}) ->
     %% 2I query on $key or $bucket field with return_body
@@ -822,7 +810,7 @@ fold_objects_fun(FoldObjectsFun, {index, FilterBucket, Q=?KV_INDEX_Q{}}) ->
             ObjectKey = from_object_key(StorageKey),
             case riak_index:object_key_in_range(ObjectKey, FilterBucket, Q) of
                 {true, {Bucket, Key}} ->
-                    stoppable_fold(FoldObjectsFun, Bucket, {o, Key, Value}, Acc);
+                    FoldObjectsFun(Bucket, {o, Key, Value}, Acc);
                 {skip, _BK} ->
                     Acc;
                 _ ->
@@ -895,7 +883,7 @@ to_object_key(Bucket, Key) ->
 
 from_object_key(LKey) ->
     case (catch sext:decode(LKey)) of
-        {'EXIT', _} -> 
+        {'EXIT', _} ->
             lager:warning("Corrupted object key, discarding"),
             ignore;
         {o, Bucket, Key} ->
@@ -912,7 +900,7 @@ to_legacy_index_key(Bucket, Key, Field, Term) -> %% encode with legacy bignum en
 
 from_index_key(LKey) ->
     case (catch sext:decode(LKey)) of
-        {'EXIT', _} -> 
+        {'EXIT', _} ->
             lager:warning("Corrupted index key, discarding"),
             ignore;
         {i, Bucket, Field, Term, Key} ->
@@ -934,12 +922,12 @@ to_md_key(Key) ->
 simple_test_() ->
     ?assertCmd("rm -rf test/eleveldb-backend"),
     application:set_env(eleveldb, data_root, "test/eleveldb-backend"),
-    riak_kv_backend:standard_test(?MODULE, []).
+    backend_test_util:standard_test(?MODULE, []).
 
 custom_config_test_() ->
     ?assertCmd("rm -rf test/eleveldb-backend"),
     application:set_env(eleveldb, data_root, ""),
-    riak_kv_backend:standard_test(?MODULE, [{data_root, "test/eleveldb-backend"}]).
+    backend_test_util:standard_test(?MODULE, [{data_root, "test/eleveldb-backend"}]).
 
 retry_test_() ->
     {spawn, [fun retry/0, fun retry_fail/0]}.

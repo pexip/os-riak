@@ -2,7 +2,7 @@
 //
 // thread_tasks.h
 //
-// Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2011-2015 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -33,6 +33,7 @@
 #include "db/db_impl.h"
 #include "db/version_set.h"
 #include "leveldb/atomics.h"
+#include "refobject_base.h"
 
 namespace leveldb {
 
@@ -40,38 +41,27 @@ namespace leveldb {
 /**
  * Virtual base class for leveldb background tasks
  */
-class ThreadTask
+class ThreadTask : public RefObjectBase
 {
-public:
-    uint64_t m_QueueStart;        //!< NowMicros() time placed on work queue
-
-protected:
-    volatile uint32_t m_RefCount;
+ protected:
+    bool m_ResubmitWork;          //!< true if this work item is loaded for prefetch
 
  public:
-    ThreadTask()
-        : m_QueueStart(0), m_RefCount(0) {};
+    uint64_t m_QueueStart;        //!< NowMicros() time placed on work queue
 
-    virtual ~ThreadTask() {};
+ public:
+    ThreadTask() : m_ResubmitWork(false), m_QueueStart(0) {}
 
-    uint32_t RefInc() {return(inc_and_fetch(&m_RefCount));};
-
-    uint32_t RefDec()
-    {
-        uint32_t current_refs;
-
-        current_refs=dec_and_fetch(&m_RefCount);
-        if (0==current_refs)
-            delete this;
-
-        return(current_refs);
-
-    }   // RefObject::RefDec
+    virtual ~ThreadTask() {}
 
     // this is the derived object's task routine
-    virtual void operator()()     = 0;
+    virtual void operator()() = 0;
 
-private:
+    // methods used by the thread pool to potentially reuse this task object
+    bool resubmit() const {return(m_ResubmitWork);}
+    virtual void recycle() {}
+
+ private:
     ThreadTask(const ThreadTask &);
     ThreadTask & operator=(const ThreadTask &);
 
@@ -104,7 +94,7 @@ private:
 
 
 /**
- * Background compaction 
+ * Background compaction
  */
 
 class CompactionTask : public ThreadTask
@@ -119,11 +109,7 @@ public:
 
     virtual ~CompactionTask() {delete m_Compaction;};
 
-    virtual void operator()() 
-    {
-        m_DBImpl->BackgroundCall2(m_Compaction);
-        m_Compaction=NULL;
-    };
+    virtual void operator()();
 
 private:
     CompactionTask();
@@ -131,6 +117,28 @@ private:
     CompactionTask & operator=(const CompactionTask &);
 
 };  // class CompactionTask
+
+
+/**
+ * Poll all databases for grooming opportunities
+ */
+
+class GroomingPollTask : public ThreadTask
+{
+protected:
+
+public:
+    GroomingPollTask() {};
+
+    virtual ~GroomingPollTask() {};
+
+    virtual void operator()();
+
+private:
+    GroomingPollTask(const GroomingPollTask &);
+    GroomingPollTask & operator=(const GroomingPollTask &);
+
+};  // class GroomingPollTask
 
 
 /**
@@ -149,7 +157,7 @@ public:
 
     virtual ~LegacyTask() {};
 
-    virtual void operator()() 
+    virtual void operator()()
     {
         (*m_Function)(m_Arg);
     };
@@ -164,4 +172,4 @@ private:
 } // namespace leveldb
 
 
-#endif  // INCL_WORKITEMS_H
+#endif  // STORAGE_LEVELDB_INCLUDE_THREAD_TASKS_H_

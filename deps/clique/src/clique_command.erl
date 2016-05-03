@@ -33,30 +33,57 @@
 -type proplist() :: [{atom(), term()}].
 -type status() :: clique_status:status().
 
--define(SET_CMD_SPEC, {["_", "set"], '_', clique_config:config_flags(), fun clique_config:set/2}).
+-define(SET_CMD_SPEC, {["_", "set"], '_', clique_config:config_flags(),
+                       fun (_, SetArgs, SetFlags) ->
+                               clique_config:set(SetArgs, SetFlags)
+                       end}).
 
 init() ->
     _ = ets:new(?cmd_table, [public, named_table]),
     ok.
 
 %% @doc Register a cli command (i.e.: "riak-admin handoff status")
--spec register([string()], list(), list(), fun()) -> true.
+-spec register(['*' | string()], '_' | list(), list(), fun()) -> ok | {error, atom()}.
 register(Cmd, Keys0, Flags0, Fun) ->
-    Keys = make_specs(Keys0),
-    Flags = make_specs(Flags0),
-    ets:insert(?cmd_table, {Cmd, Keys, Flags, Fun}).
+    case verify_register(Cmd) of
+        ok ->
+            Keys = case Keys0 of
+                       '_' -> '_';
+                       _ -> make_specs(Keys0)
+                   end,
+            Flags = make_specs(Flags0),
+            ets:insert(?cmd_table, {Cmd, Keys, Flags, Fun}),
+            ok;
+        {error, Err} ->
+            error_logger:info_report([{warning, "Clique command registration failed"},
+                                      {reason, Err},
+                                      {command, Cmd},
+                                      {keys, Keys0},
+                                      {flags, Flags0}]),
+            {error, Err}
+    end.
+
+verify_register(Cmd) ->
+    %% Only thing we currently verify is whether any/all wildcard '*' atoms are grouped at the end
+    CmdTail = lists:dropwhile(fun(E) -> E =/= '*' end, Cmd),
+    case lists:any(fun(E) -> E =/= '*' end, CmdTail) of
+        true ->
+            {error, bad_wildcard_placement};
+        false ->
+            ok
+    end.
 
 -spec run(err()) -> err();
-         ({fun(), proplist(), proplist()})-> status().
+         ({fun(), [string()], proplist(), proplist()})-> status().
 run({error, _}=E) ->
     E;
-run({Fun, Args, Flags, GlobalFlags}) ->
+run({Fun, Cmd, Args, Flags, GlobalFlags}) ->
     Format = proplists:get_value(format, GlobalFlags, "human"),
     case proplists:is_defined(help, GlobalFlags) of
         true ->
             {usage, Format};
         false ->
-            Result = Fun(Args, Flags),
+            Result = Fun(Cmd, Args, Flags),
             {Result, Format}
     end.
 
@@ -74,11 +101,36 @@ match(Cmd0) ->
             Spec = cmd_spec(Cmd, fun clique_config:describe/2, []),
             {Spec, Args};
         _ ->
-            case ets:lookup(?cmd_table, Cmd) of
-                [Spec] ->
+            case match_lookup(Cmd) of
+                {match, Spec0} ->
+                    %% The matching spec will include the command as-registered, including
+                    %% wildcards, but we want to return back the actual command the user
+                    %% entered so that we can pass the correct stuff along to the cmd callback:
+                    Spec = setelement(1, Spec0, Cmd),
                     {Spec, Args};
-                [] ->
+                nomatch ->
                     {error, {no_matching_spec, Cmd0}}
+            end
+    end.
+
+match_lookup(Cmd) ->
+    case ets:lookup(?cmd_table, Cmd) of
+        [Spec] ->
+            {match, Spec};
+        [] ->
+            %% To support wildcards in our command specs, we'll need to recurse through a
+            %% series of ets:lookup calls, with each successive call being less restrictive.
+            %% Start by pulling all the wildcards off of the tail:
+            RevCmd = lists:reverse(Cmd),
+            case lists:splitwith(fun(E) -> E =:= '*' end, RevCmd) of
+                {_, []} ->
+                    %% At this point, everything is a wildcard, so bail out:
+                    nomatch;
+                {Wildcards, [_H | T]} ->
+                    %% Convert the last non-wildcard element in the
+                    %% command to a wildcard, and try the match again:
+                    NextMatchAttempt = lists:reverse(T) ++ ['*' | Wildcards],
+                    match_lookup(NextMatchAttempt)
             end
     end.
 
@@ -102,5 +154,5 @@ make_specs(Specs) ->
 cmd_spec(Cmd, CmdFun, AllowedFlags) ->
     [_Script, _CmdName | CfgKeys] = Cmd,
     %% Discard key/val args passed in since we don't need them, and inject the freeform args:
-    SpecFun = fun([], Flags) -> CmdFun(CfgKeys, Flags) end,
+    SpecFun = fun(_, [], Flags) -> CmdFun(CfgKeys, Flags) end,
     {Cmd, [], AllowedFlags, SpecFun}.

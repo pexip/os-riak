@@ -51,3 +51,20 @@
   {datatype, directory},
   hidden
 ]}.
+
+%% @doc The temp directory for Search, under which the Solr webapp
+%% will be expanded and other temp data stored.
+{mapping, "search.temp_dir", "yokozuna.temp_dir", [
+  {default, "$(platform_data_dir)/yz_temp"},
+  {datatype, directory},
+  hidden
+]}.
+
+%% @doc The timeout for ibrowse (ibrowse:send_req) requests to Solr endpoints.
+%% Defaults to 60 seconds. It will always round up to the nearest second, e.g.
+%% 1ms = 999 ms = 1s.
+{mapping, "search.solr.request_timeout", "yokozuna.solr_request_timeout", [
+  {default, "60s"},
+  {datatype, {duration, ms}},
+  hidden
+]}.

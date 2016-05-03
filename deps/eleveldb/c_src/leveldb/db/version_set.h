@@ -102,7 +102,8 @@ class Version {
   // Return the level at which we should place a new memtable compaction
   // result that covers the range [smallest_user_key,largest_user_key].
   int PickLevelForMemTableOutput(const Slice& smallest_user_key,
-                                 const Slice& largest_user_key);
+                                 const Slice& largest_user_key,
+                                 const int level_limit);
 
   size_t NumFiles(int level) const { return files_[level].size(); }
 
@@ -243,7 +244,11 @@ class VersionSet {
       if (0==penalty && 1!=throttle)
           ret_val=(int)throttle;
       else if (0!=penalty)
+      {
+          if (throttle<GetUnadjustedThrottleWriteRate())
+              throttle=GetUnadjustedThrottleWriteRate();
           ret_val=(int)penalty * throttle;
+      }   // else if
 
       return(ret_val);
   }
@@ -308,9 +313,12 @@ class VersionSet {
   void SetCompactionRunning(int level)
   {m_CompactionStatus[level].m_Running=true;}
 
-  void SetCompactionDone(int level)
+  void SetCompactionDone(int level, uint64_t Now)
   {   m_CompactionStatus[level].m_Running=false;
-      m_CompactionStatus[level].m_Submitted=false;}
+      m_CompactionStatus[level].m_Submitted=false;
+      m_CompactionStatus[level].m_LastCompaction=Now; }
+
+  bool NeighborCompactionsQuiet(int level);
 
  private:
   class Builder;
@@ -367,9 +375,10 @@ class VersionSet {
   {
       bool m_Submitted;     //!< level submitted to hot thread pool
       bool m_Running;       //!< thread actually running compaction
+      uint64_t m_LastCompaction; //!<NowMicros() when last compaction completed
 
       CompactionStatus_s()
-      : m_Submitted(false), m_Running(false)
+      : m_Submitted(false), m_Running(false), m_LastCompaction(0)
       {};
   } m_CompactionStatus[config::kNumLevels];
 
@@ -428,6 +437,7 @@ class Compaction {
   size_t AverageValueSize()  const {return(avg_value_size_);};
   size_t AverageKeySize()    const {return(avg_key_size_);};
   size_t AverageBlockSize()  const {return(avg_block_size_);};
+  bool IsCompressible()      const {return(compressible_);};
 
  private:
   friend class Version;
@@ -465,6 +475,7 @@ class Compaction {
   size_t avg_value_size_;
   size_t avg_key_size_;
   size_t avg_block_size_;
+  bool compressible_;
   bool stats_done_;
 };
 

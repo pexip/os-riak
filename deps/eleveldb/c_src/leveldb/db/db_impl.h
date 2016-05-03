@@ -45,6 +45,7 @@ class DBImpl : public DB {
   virtual void GetApproximateSizes(const Range* range, int n, uint64_t* sizes);
   virtual void CompactRange(const Slice* begin, const Slice* end);
   virtual Status VerifyLevels();
+  virtual void CheckAvailableCompactions();
 
   // Extra methods (for testing) that are not in the public DB interface
 
@@ -109,6 +110,8 @@ class DBImpl : public DB {
   Status WriteLevel0Table(volatile MemTable* mem, VersionEdit* edit, Version* base);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */);
+  Status NewRecoveryLog(uint64_t NewLogNumber);
+
   WriteBatch* BuildBatchGroup(Writer** last_writer);
 
   void MaybeScheduleCompaction();

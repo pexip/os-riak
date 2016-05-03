@@ -102,11 +102,17 @@ init() ->
                          {delete_threshold, pos_integer()} |
                          {tiered_slow_level, pos_integer()} |
                          {tiered_fast_prefix, string()} |
-                         {tiered_slow_prefix, string()}].
+                         {tiered_slow_prefix, string()} |
+                         {cache_object_warming, boolean()}].
 
--type read_options() :: [{verify_checksums, boolean()} |
-                         {fill_cache, boolean()} |
-                         {iterator_refresh, boolean()}].
+-type read_option() :: {verify_checksums, boolean()} |
+                       {fill_cache, boolean()} |
+                       {iterator_refresh, boolean()}.
+
+-type read_options() :: [read_option()].
+
+-type fold_option()  :: {first_key, Key::binary()}.
+-type fold_options() :: [read_option() | fold_option()].
 
 -type write_options() :: [{sync, boolean()}].
 
@@ -228,7 +234,7 @@ async_iterator_close(_CallerRef, _IRef) ->
 
 %% Fold over the keys and values in the database
 %% will throw an exception if the database is closed while the fold runs
--spec fold(db_ref(), fold_fun(), any(), read_options()) -> any().
+-spec fold(db_ref(), fold_fun(), any(), fold_options()) -> any().
 fold(Ref, Fun, Acc0, Opts) ->
     {ok, Itr} = iterator(Ref, Opts),
     do_fold(Itr, Fun, Acc0, Opts).
@@ -250,13 +256,16 @@ status(Ref, Key) ->
 status_int(_Ref, _Key) ->
     erlang:nif_error({error, not_loaded}).
 
+-spec async_destroy(reference(), string(), open_options()) -> ok.
+async_destroy(_CallerRef, _Name, _Opts) ->
+    erlang:nif_error({error, not_loaded}).
+
 -spec destroy(string(), open_options()) -> ok | {error, any()}.
 destroy(Name, Opts) ->
-    eleveldb_bump:big(),
-    destroy_int(Name, Opts).
-
-destroy_int(_Name, _Opts) ->
-    erlang:nif_error({erlang, not_loaded}).
+    CallerRef = make_ref(),
+    Opts2 = add_open_defaults(Opts),
+    async_destroy(CallerRef, Name, Opts2),
+    ?WAIT_FOR_REPLY(CallerRef).
 
 repair(Name, Opts) ->
     eleveldb_bump:big(),
@@ -297,7 +306,8 @@ option_types(open) ->
      {delete_threshold, integer},
      {tiered_slow_level, integer},
      {tiered_fast_prefix, any},
-     {tiered_slow_prefix, any}];
+     {tiered_slow_prefix, any},
+     {cache_object_warming, bool}];
 
 option_types(read) ->
     [{verify_checksums, bool},

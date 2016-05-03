@@ -76,20 +76,6 @@ static int64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
   return sum;
 }
 
-namespace {
-std::string IntSetToString(const std::set<uint64_t>& s) {
-  std::string result = "{";
-  for (std::set<uint64_t>::const_iterator it = s.begin();
-       it != s.end();
-       ++it) {
-    result += (result.size() > 1) ? "," : "";
-    result += NumberToString(*it);
-  }
-  result += "}";
-  return result;
-}
-}  // namespace
-
 Version::~Version() {
   assert(refs_ == 0);
 
@@ -175,7 +161,7 @@ bool SomeFileOverlapsRange(
   uint32_t index = 0;
   if (smallest_user_key != NULL) {
     // Find the earliest possible internal key for smallest_user_key
-    InternalKey small(*smallest_user_key, kMaxSequenceNumber,kValueTypeForSeek);
+    InternalKey small(*smallest_user_key, 0, kMaxSequenceNumber, kValueTypeForSeek);
     index = FindFile(icmp, files, small.Encode());
   }
 
@@ -321,7 +307,7 @@ static bool SaveValue(void* arg, const Slice& ikey, const Slice& v) {
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
       match=true;
-      s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+      s->state = (parsed_key.type != kTypeDeletion) ? kFound : kDeleted;
       if (s->state == kFound) {
         s->value->assign(v.data(), v.size());
       }
@@ -395,7 +381,7 @@ Status Version::Get(const ReadOptions& options,
     }
 
     if (0!=num_files)
-        gPerfCounters->Inc(ePerfSearchLevel0 + level);
+        gPerfCounters->Add(ePerfSearchLevel0 + level, num_files);
 
     for (uint32_t i = 0; i < num_files; ++i) {
       if (last_file_read != NULL && stats->seek_file == NULL) {
@@ -475,29 +461,34 @@ bool Version::OverlapInLevel(int level,
 
 int Version::PickLevelForMemTableOutput(
     const Slice& smallest_user_key,
-    const Slice& largest_user_key) {
+    const Slice& largest_user_key,
+    const int level_limit) {
   int level = 0;
-#if 0
+
 // test if level 1 m_OverlappedFiles is false, proceded only then
   if (!OverlapInLevel(0, &smallest_user_key, &largest_user_key)) {
     // Push to next level if there is no overlap in next level,
     // and the #bytes overlapping in the level after that are limited.
-    InternalKey start(smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek);
-    InternalKey limit(largest_user_key, 0, static_cast<ValueType>(0));
+    InternalKey start(smallest_user_key, 0, kMaxSequenceNumber, kValueTypeForSeek);
+    InternalKey limit(largest_user_key, 0, 0, static_cast<ValueType>(0));
     std::vector<FileMetaData*> overlaps;
-    while (level < config::kMaxMemCompactLevel) {
+    while (level < level_limit) {
       if (OverlapInLevel(level + 1, &smallest_user_key, &largest_user_key)) {
         break;
       }
       GetOverlappingInputs(level + 2, &start, &limit, &overlaps);
-      const int64_t sum = TotalFileSize(overlaps);
+      const uint64_t sum = TotalFileSize(overlaps);
       if (sum > gLevelTraits[level].m_MaxGrandParentOverlapBytes) {
         break;
       }
       level++;
     }
+    // do not waste a move into an overlapped level, breaks
+    //  different performance improvement
+    if (gLevelTraits[level].m_OverlappedFiles)
+        level=0;
   }
-#endif
+
   return level;
 }
 
@@ -509,36 +500,28 @@ void Version::GetOverlappingInputs(
     std::vector<FileMetaData*>* inputs) {
   inputs->clear();
   Slice user_begin, user_end;
+
+  // overlap takes everything
+  bool test_inputs(!gLevelTraits[level].m_OverlappedFiles);
+
   if (begin != NULL) {
-    user_begin = begin->user_key();
+      user_begin = begin->user_key();
   }
   if (end != NULL) {
-    user_end = end->user_key();
+      user_end = end->user_key();
   }
+
   const Comparator* user_cmp = vset_->icmp_.user_comparator();
   for (size_t i = 0; i < files_[level].size(); ) {
     FileMetaData* f = files_[level][i++];
     const Slice file_start = f->smallest.user_key();
     const Slice file_limit = f->largest.user_key();
-    if (begin != NULL && user_cmp->Compare(file_limit, user_begin) < 0) {
+    if (test_inputs && begin != NULL && user_cmp->Compare(file_limit, user_begin) < 0) {
       // "f" is completely before specified range; skip it
-    } else if (end != NULL && user_cmp->Compare(file_start, user_end) > 0) {
+    } else if (test_inputs && end != NULL && user_cmp->Compare(file_start, user_end) > 0) {
       // "f" is completely after specified range; skip it
     } else {
       inputs->push_back(f);
-      if (gLevelTraits[level].m_OverlappedFiles) {
-        // Level files may overlap each other.  So check if the newly
-        // added file has expanded the range.  If so, restart search.
-        if (begin != NULL && user_cmp->Compare(file_start, user_begin) < 0) {
-          user_begin = file_start;
-          inputs->clear();
-          i = 0;
-        } else if (end != NULL && user_cmp->Compare(file_limit, user_end) > 0) {
-          user_end = file_limit;
-          inputs->clear();
-          i = 0;
-        }
-      }
     }
   }
 }
@@ -1065,6 +1048,22 @@ void VersionSet::MarkFileNumberUsed(uint64_t number) {
   }
 }
 
+
+bool
+VersionSet::NeighborCompactionsQuiet(int level)
+{
+    const uint64_t parent_level_bytes = TotalFileSize(current_->files_[level+1]);
+
+    // not an overlapped level and must not have compactions
+    //   scheduled on either level below or level above
+    return((0==level || !m_CompactionStatus[level-1].m_Submitted)
+           && !gLevelTraits[level].m_OverlappedFiles
+           && !m_CompactionStatus[level+1].m_Submitted
+           && parent_level_bytes<=((gLevelTraits[level+1].m_MaxBytesForLevel
+                                    +gLevelTraits[level+1].m_DesiredBytesForLevel)/2));
+}   // VersionSet::NeighborCompactionsQuiet
+
+
 bool
 VersionSet::Finalize(Version* v)
 {
@@ -1073,13 +1072,17 @@ VersionSet::Finalize(Version* v)
     double best_score = -1;
     bool compaction_found;
     bool is_grooming;
+    uint64_t micros_now;
 
     compaction_found=false;
     is_grooming=false;
+    micros_now=env_->NowMicros();
+
     for (int level = v->compaction_level_+1; level < config::kNumLevels-1 && !compaction_found; ++level)
     {
         bool compact_ok;
         double score;
+        const uint64_t parent_level_bytes = TotalFileSize(v->files_[level+1]);
 
         is_grooming=false;
         // is this level eligible for compaction consideration?
@@ -1095,7 +1098,8 @@ VersionSet::Finalize(Version* v)
             }   // if
 
             // overlapped and next level is not compacting
-            else if (gLevelTraits[level].m_OverlappedFiles && !m_CompactionStatus[level+1].m_Submitted)
+            else if (gLevelTraits[level].m_OverlappedFiles && !m_CompactionStatus[level+1].m_Submitted
+                     && parent_level_bytes<=gLevelTraits[level+1].m_DesiredBytesForLevel)
             {
                 // good ... stop consideration
             }   // else if
@@ -1103,13 +1107,37 @@ VersionSet::Finalize(Version* v)
             else
             {
                 // must not have compactions scheduled on neither level below nor level above
-                compact_ok=(!m_CompactionStatus[level-1].m_Submitted && !m_CompactionStatus[level+1].m_Submitted);
+                compact_ok=NeighborCompactionsQuiet(level);
             }   // else
         }   // if
 
         // consider this level
         if (compact_ok)
         {
+            size_t grooming_trigger;
+            uint64_t elapsed_micros;
+
+            // some platforms use gettimeofday() which can move backward
+            if ( m_CompactionStatus[level].m_LastCompaction < micros_now
+                 && 0 != m_CompactionStatus[level].m_LastCompaction)
+                elapsed_micros=micros_now - m_CompactionStatus[level].m_LastCompaction;
+            else
+                elapsed_micros=0;
+
+            // which grooming trigger point?  based upon how long
+            //  since last compaction on this level
+            //   - less than 10 minutes?
+            if (elapsed_micros < config::kL0_Grooming10minMicros)
+                grooming_trigger=config::kL0_GroomingTrigger;
+
+            //   - less than 20 minutes?
+            else if (elapsed_micros < config::kL0_Grooming20minMicros)
+                grooming_trigger=config::kL0_GroomingTrigger10min;
+
+            //   - more than 20 minutes
+            else
+                grooming_trigger=config::kL0_GroomingTrigger20min;
+
             if (gLevelTraits[level].m_OverlappedFiles) {
                 // We treat level-0 specially by bounding the number of files
                 // instead of number of bytes for two reasons:
@@ -1133,8 +1161,7 @@ VersionSet::Finalize(Version* v)
                 if (!gLevelTraits[level+1].m_OverlappedFiles
                     && v->files_[level].size()< config::kL0_SlowdownWritesTrigger)
                 {
-                    const uint64_t level_bytes = TotalFileSize(v->files_[level+1]);
-                    if (1 < (level_bytes / gLevelTraits[level+1].m_DesiredBytesForLevel))
+                    if (1 < (parent_level_bytes / gLevelTraits[level+1].m_DesiredBytesForLevel))
                         score=0;
                 }   // if
 
@@ -1142,7 +1169,7 @@ VersionSet::Finalize(Version* v)
 
                 // early overlapped compaction
                 //  only occurs if no other compactions running on groomer thread
-                if (0==score && config::kL0_GroomingTrigger<=v->files_[level].size())
+                if (0==score && grooming_trigger<=v->files_[level].size())
                 {
                     score=1;
                     is_grooming=true;
@@ -1178,7 +1205,6 @@ VersionSet::Finalize(Version* v)
                             v->file_to_compact_=*it;
                             v->file_to_compact_level_=level;
                             is_grooming=true;
-                            gPerfCounters->Inc(ePerfDebug0);
                         }
                     }   // for
                 }   // if
@@ -1219,8 +1245,13 @@ VersionSet::UpdatePenalty(
 
     for (int level = 0; level < config::kNumLevels-1; ++level)
     {
+        int loop, count, value, increment;
+        value=0;
+        count=0;
+
         if (gLevelTraits[level].m_OverlappedFiles)
         {
+
             // compute penalty for write throttle if too many Level-0 files accumulating
             if (config::kL0_CompactionTrigger < v->files_[level].size())
             {
@@ -1228,62 +1259,60 @@ VersionSet::UpdatePenalty(
                 //   and we are "close" on compaction backlog
                 if ( v->files_[level].size() < config::kL0_SlowdownWritesTrigger)
                 {
-                    penalty+= (v->files_[level].size() - config::kL0_CompactionTrigger);
+                    value = (v->files_[level].size() - config::kL0_CompactionTrigger);
+                    count=0;
                 }   // if
 
                 // no longer estimating work, now trying to throw on the breaks
                 //  to keep leveldb from stalling
                 else
                 {
-                    int loop, count, value, increment;
-
                     count=(v->files_[level].size() - config::kL0_SlowdownWritesTrigger);
 
                     // level 0 has own thread pool and will stall writes,
                     //  heavy penalty
                     if (0==level)
                     {   // non-linear penalty
-                        value=4;
+                        value=5;
                         increment=8;
                     }   // if
                     else
-                    {   // linear penalty
-                        value=count;
-                        increment=1;
+                    {   // slightly less penalty
+                        value=count+1;
+                        count=0;
                     }   // else
-
-                    for (loop=0; loop<count; ++loop)
-                        value*=increment;
-
-                    penalty+=value;
                 }   // else
             }   // if
         }   // if
         else
         {
-            // Compute the ratio of current size to size limit.
-            double penalty_score;
-
             const uint64_t level_bytes = TotalFileSize(v->files_[level]);
 
-            if (config::kNumOverlapLevels!=level)
-            {
-                penalty_score = static_cast<double>(level_bytes) / gLevelTraits[level].m_MaxBytesForLevel;
+            count=static_cast<double>(level_bytes) / gLevelTraits[level].m_MaxBytesForLevel;
 
-                // penalty needs to be non-linear once it exceeds 1.0 (especially for tiered storage).
-                //  original values of penalty_score below one are not relevant, hence square of less than one
-                //  is equally ignored.
-                penalty_score *= penalty_score;
+            if (0<count)
+            {
+                value=5;
+                increment=8;
             }   // if
-            // first sort layer needs to clear before next dump of overlapped files.
-            else
-            {
-                penalty_score = (1<(static_cast<double>(level_bytes) / gLevelTraits[level].m_DesiredBytesForLevel)? 1.0 : 0);
-            }   // else
 
-            if (1.0<=penalty_score)
-                penalty+=(static_cast<int>(penalty_score));
+            // this penalty is not about "backlog", its goal is to
+            //  slow the operations during a known period of high
+            //  background activity.  Overall, latencies get better
+            //  not worse because of this.
+            else if (config::kNumOverlapLevels==level)
+            {   // light penalty
+                count=static_cast<double>(level_bytes) / gLevelTraits[level].m_DesiredBytesForLevel;
+                value=count; // this approximates the number of compactions needed, no other penalty
+                increment=1;
+                count=0;
+            }   // else if
         }   // else
+
+        for (loop=0; loop<count; ++loop)
+            value*=increment;
+
+        penalty+=value;
 
     }   // for
 
@@ -1768,6 +1797,7 @@ Compaction::Compaction(int level)
       overlapped_bytes_(0),
       tot_user_data_(0), tot_index_keys_(0),
       avg_value_size_(0), avg_key_size_(0), avg_block_size_(0),
+      compressible_(true),
       stats_done_(false)
   {
   for (int i = 0; i < config::kNumLevels; i++) {
@@ -1785,10 +1815,11 @@ bool Compaction::IsTrivialMove() const {
   // Avoid a move if there is lots of overlapping grandparent data.
   // Otherwise, the move could create a parent file that will require
   // a very expensive merge later on.
-#if 0
-  return (num_input_files(0) == 1 &&
+#if 1
+  return (!gLevelTraits[level_].m_OverlappedFiles &&
+          num_input_files(0) == 1 &&
           num_input_files(1) == 0 &&
-          TotalFileSize(grandparents_) <= gLevelTraits[level_].m_MaxGrandParentOverlapBytes);
+          (uint64_t)TotalFileSize(grandparents_) <= gLevelTraits[level_].m_MaxGrandParentOverlapBytes);
 #else
   // removed this functionality when creating gLevelTraits[].m_OverlappedFiles
   //  flag.  "Move" was intented by Google to delay compaction by moving small
@@ -1853,12 +1884,12 @@ bool Compaction::ShouldStopBefore(const Slice& internal_key, size_t key_count) {
     // Scan to find earliest grandparent file that contains key.
     const InternalKeyComparator* icmp = &input_version_->vset_->icmp_;
     while (grandparent_index_ < grandparents_.size() &&
-	   icmp->Compare(internal_key,
-			 grandparents_[grandparent_index_]->largest.Encode()) > 0) {
+           icmp->Compare(internal_key,
+                         grandparents_[grandparent_index_]->largest.Encode()) > 0) {
       if (seen_key_) {
-	overlapped_bytes_ += grandparents_[grandparent_index_]->file_size;
+        overlapped_bytes_ += grandparents_[grandparent_index_]->file_size;
       }
-      grandparent_index_++;
+        grandparent_index_++;
     }
     seen_key_ = true;
 
@@ -1872,7 +1903,7 @@ bool Compaction::ShouldStopBefore(const Slice& internal_key, size_t key_count) {
     else
     {
       ret_flag=(300000<key_count);
-     } // else
+    } // else
   }  // if
 
   if (ret_flag)
@@ -1897,7 +1928,6 @@ Compaction::CalcInputStats(
 {
     uint64_t temp, temp_cnt;
     size_t value_count, key_count, block_count;
-    std::vector<FileMetaData *>::iterator it;
 
     if (!stats_done_)
     {
@@ -1906,119 +1936,127 @@ Compaction::CalcInputStats(
         avg_value_size_=0; value_count=0;
         avg_key_size_=0;   key_count=0;
         avg_block_size_=0; block_count=0;
+        compressible_=(0==level_);
 
         // walk both levels of input files
-        for (it=inputs_[0].begin();
-             inputs_[1].end()!=it;
-             (inputs_[0].end()!=it ? ++it:  it=inputs_[1].begin()))
+        const size_t level0Count = inputs_[0].size();
+        const size_t level1Count = inputs_[1].size();
+        const size_t totalCount = level0Count + level1Count;
+
+        for (size_t j = 0; j < totalCount; ++j)
         {
-            // only do actions if not about to switch levels
-            if (inputs_[0].end()!=it)
+            FileMetaData * fmd;
+            Status s;
+            Cache::Handle * handle;
+            size_t user_est, idx_est;
+
+            fmd=(j < level0Count) ? inputs_[0][j] : inputs_[1][j-level0Count];
+
+            // compression test
+            // true if more data blocks than data blocks that did not compress
+            //    or if no statistics available
+            compressible_ = compressible_
+                            || (tables.GetStatisticValue(fmd->number, eSstCountBlocks)
+                               >tables.GetStatisticValue(fmd->number, eSstCountCompressAborted))
+                              || 0==tables.GetStatisticValue(fmd->number, eSstCountBlocks);
+
+            // block sizing algorithm
+            temp=0;
+            temp_cnt=0;
+            user_est=0;
+            idx_est=0;
+
+            // get and hold handle to cache entry
+            s=tables.TEST_FindTable(fmd->number, fmd->file_size, fmd->level, &handle);
+
+            if (s.ok())
             {
-                FileMetaData * fmd;
-                Status s;
-                Cache::Handle * handle;
-                size_t user_est, idx_est;
+                // 1. total size of all blocks before compaction
+                temp=tables.GetStatisticValue(fmd->number, eSstCountBlockSize);
 
-                fmd=*it;
-                temp=0;
-                temp_cnt=0;
-                user_est=0;
-                idx_est=0;
-
-                // get and hold handle to cache entry
-                s=tables.TEST_FindTable(fmd->number, fmd->file_size, fmd->level, &handle);
-
-                if (s.ok())
+                // estimate size when counter does not exist
+                if (0==temp)
                 {
-                    // 1. total size of all blocks before compaction
-                    temp=tables.GetStatisticValue(fmd->number, eSstCountBlockSize);
+                    TableAndFile * tf;
 
-                    // estimate size when counter does not exist
-                    if (0==temp)
-                    {
-                        TableAndFile * tf;
-
-                        tf=reinterpret_cast<TableAndFile*>(tables.TEST_GetInternalCache()->Value(handle));
-                        if (tf->table->TableObjectSize() < fmd->file_size)
-                            temp=fmd->file_size - tf->table->TableObjectSize();
-                    }   // if
-
-                    user_est=temp;
-                    tot_user_data_+=temp;
-
-                    // 2. total keys in the indexes
-                    temp=tables.GetStatisticValue(fmd->number, eSstCountIndexKeys);
-
-                    // estimate total when counter does not exist
-                    if (0==temp)
-                    {
-                        TableAndFile * tf;
-                        Block * index_block;
-
-                        tf=reinterpret_cast<TableAndFile*>(tables.TEST_GetInternalCache()->Value(handle));
-                        index_block=tf->table->TEST_GetIndexBlock();
-                        temp=index_block->NumRestarts();
-                    }   // if
-
-                    idx_est=temp;
-                    tot_index_keys_+=temp;
-
-                    // 3. average size of values in input set
-                    //    (value is really size of value plus size of key)
-                    temp=tables.GetStatisticValue(fmd->number, eSstCountValueSize);
-                    temp+=tables.GetStatisticValue(fmd->number, eSstCountKeySize);
-                    temp_cnt=tables.GetStatisticValue(fmd->number, eSstCountKeys);
-
-                    // estimate total when counter does not exist
-                    if (0==temp || 0==temp_cnt)
-                    {
-                        // no way to estimate total key count
-                        //  (ok, could try from bloom filter size ... but likely no
-                        //   bloom filter if no stats)
-                        temp=0;
-                        temp_cnt=0;
-                    }   // if
-
-                    avg_value_size_+=temp;
-                    value_count+=temp_cnt;
-
-                    // 4. average key size
-                    temp=tables.GetStatisticValue(fmd->number, eSstCountKeySize);
-                    temp_cnt=tables.GetStatisticValue(fmd->number, eSstCountKeys);
-
-                    // estimate total when counter does not exist
-                    if (0==temp || 0==temp_cnt)
-                    {
-                        // no way to estimate total key count
-                        //  (ok, could try from bloom filter size ... but likely no
-                        //   bloom filter if no stats)
-                        temp=0;
-                        temp_cnt=0;
-                    }   // if
-
-                    avg_key_size_+=temp;
-                    key_count+=temp_cnt;
-
-                    // 5. block key size
-                    temp=tables.GetStatisticValue(fmd->number, eSstCountBlockSizeUsed);
-                    temp_cnt=tables.GetStatisticValue(fmd->number, eSstCountBlocks);
-                    temp*=temp_cnt;
-
-                    // estimate total when counter does not exist
-                    if (0==temp || 0==temp_cnt)
-                    {
-                        temp=user_est;
-                        temp_cnt=idx_est;
-                    }   // if
-
-                    avg_block_size_+=temp;
-                    block_count+=temp_cnt;
-
-                    // cleanup
-                    tables.Release(handle);
+                    tf=reinterpret_cast<TableAndFile*>(tables.TEST_GetInternalCache()->Value(handle));
+                    if (tf->table->TableObjectSize() < fmd->file_size)
+                        temp=fmd->file_size - tf->table->TableObjectSize();
                 }   // if
 
+                user_est=temp;
+                tot_user_data_+=temp;
+
+                // 2. total keys in the indexes
+                temp=tables.GetStatisticValue(fmd->number, eSstCountIndexKeys);
+
+                // estimate total when counter does not exist
+                if (0==temp)
+                {
+                    TableAndFile * tf;
+                    Block * index_block;
+
+                    tf=reinterpret_cast<TableAndFile*>(tables.TEST_GetInternalCache()->Value(handle));
+                    index_block=tf->table->TEST_GetIndexBlock();
+                    temp=index_block->NumRestarts();
+                }   // if
+
+                idx_est=temp;
+                tot_index_keys_+=temp;
+
+                // 3. average size of values in input set
+                //    (value is really size of value plus size of key)
+                temp=tables.GetStatisticValue(fmd->number, eSstCountValueSize);
+                temp+=tables.GetStatisticValue(fmd->number, eSstCountKeySize);
+                temp_cnt=tables.GetStatisticValue(fmd->number, eSstCountKeys);
+
+                // estimate total when counter does not exist
+                if (0==temp || 0==temp_cnt)
+                {
+                    // no way to estimate total key count
+                    //  (ok, could try from bloom filter size ... but likely no
+                    //   bloom filter if no stats)
+                    temp=0;
+                    temp_cnt=0;
+                }   // if
+
+                avg_value_size_+=temp;
+                value_count+=temp_cnt;
+
+                // 4. average key size
+                temp=tables.GetStatisticValue(fmd->number, eSstCountKeySize);
+                temp_cnt=tables.GetStatisticValue(fmd->number, eSstCountKeys);
+
+                // estimate total when counter does not exist
+                if (0==temp || 0==temp_cnt)
+                {
+                    // no way to estimate total key count
+                    //  (ok, could try from bloom filter size ... but likely no
+                    //   bloom filter if no stats)
+                    temp=0;
+                    temp_cnt=0;
+                }   // if
+
+                avg_key_size_+=temp;
+                key_count+=temp_cnt;
+
+                // 5. block key size
+                temp=tables.GetStatisticValue(fmd->number, eSstCountBlockSizeUsed);
+                temp_cnt=tables.GetStatisticValue(fmd->number, eSstCountBlocks);
+                temp*=temp_cnt;
+
+                // estimate total when counter does not exist
+                if (0==temp || 0==temp_cnt)
+                {
+                    temp=user_est;
+                    temp_cnt=idx_est;
+                }   // if
+
+                avg_block_size_+=temp;
+                block_count+=temp_cnt;
+
+                // cleanup
+                tables.Release(handle);
             }   // if
         }   // for
 
