@@ -90,7 +90,7 @@ class CondVar;
 
 class Mutex {
  public:
-  Mutex();
+  Mutex(bool recursive=false); // true => creates a mutex that can be locked recursively
   ~Mutex();
 
   void Lock();
@@ -135,6 +135,11 @@ class CondVar {
   explicit CondVar(Mutex* mu);
   ~CondVar();
   void Wait();
+
+  // waits on the condition variable until the specified time is reached
+  bool // true => the condition variable was signaled, else timed out
+  Wait(struct timespec* pTimespec);
+
   void Signal();
   void SignalAll();
  private:
@@ -200,6 +205,28 @@ inline bool Snappy_Uncompress(const char* input, size_t length,
 
 inline bool GetHeapProfile(void (*func)(void*, const char*, int), void* arg) {
   return false;
+}
+
+// sets the name of the current thread
+inline void SetCurrentThreadName(const char* threadName) {
+  if (NULL == threadName) {
+    threadName = "";
+  }
+#if defined(OS_MACOSX)
+  pthread_setname_np(threadName);
+//#elif defined(OS_LINUX) 
+#elif defined(__GLIBC__) 
+#if  __GLIBC_PREREQ(2,12)
+  pthread_setname_np(pthread_self(), threadName);
+#endif
+#elif defined(OS_NETBSD)
+  pthread_setname_np(pthread_self(), threadName, NULL);
+#else
+  // we have some other platform(s) to support
+  //   defined(OS_FREEBSD) ... freebsd-9.2, Feb 19, 2016 not working
+  //
+  // NOTE: do not fail here since this functionality is optional
+#endif
 }
 
 } // namespace port

@@ -1,4 +1,3 @@
-%% -*- coding: latin-1 -*-
 %% Copyright (c) 2011-2012 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
@@ -103,8 +102,9 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
             {error, {fatal, bad_config}};
         Config ->
             %% probabably a better way to do this, but whatever
-            [Name, Level, Date, Size, Count, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig] =
+            [RelName, Level, Date, Size, Count, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig] =
               [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config]],
+            Name = lager_util:expand_path(RelName),
             schedule_rotation(Name, Date),
             State0 = #state{name=Name, level=Level, size=Size, date=Date, count=Count, formatter=Formatter,
                 formatter_config=FormatterConfig, sync_on=SyncOn, sync_interval=SyncInterval, sync_size=SyncSize,
@@ -464,6 +464,9 @@ filesystem_test_() ->
     {foreach,
         fun() ->
                 file:write_file("test.log", ""),
+                file:delete("foo.log"),
+                file:delete("foo.log.0"),
+                file:delete("foo.log.1"),
                 error_logger:tty(false),
                 application:load(lager),
                 application:set_env(lager, handlers, [{lager_test_backend, info}]),
@@ -502,7 +505,7 @@ filesystem_test_() ->
                 fun() ->
                         %% XXX if this test fails, check that this file is encoded latin-1, not utf-8!
                         gen_event:add_handler(lager_event, lager_file_backend, [{"test.log", info}, {lager_default_formatter}]),
-                        lager:log(error, self(),"~ts", ["LÆÝÎN-ï"]),
+                        lager:log(error, self(),"~ts", [[76, 198, 221, 206, 78, $-, 239]]),
                         {ok, Bin} = file:read_file("test.log"),
                         Pid = pid_to_list(self()),
                         Res = re:split(Bin, " ", [{return, list}, {parts, 5}]),
@@ -703,6 +706,36 @@ filesystem_test_() ->
                         lager:log(error, self(), "Test message"),
                         {ok, Bin3} = file:read_file("foo.log"),
                         ?assertMatch([_, _, "[error]", _, "Test message\n"], re:split(Bin3, " ", [{return, list}, {parts, 5}]))
+                end
+            },
+            {"tracing to a dedicated file should work even if root_log is set",
+                fun() ->
+                        {ok, P} = file:get_cwd(),
+                        file:delete(P ++ "/test_root_log/foo.log"),
+                        application:set_env(lager, log_root, P++"/test_root_log"),
+                        {ok, _} = lager:trace_file("foo.log", [{module, ?MODULE}]),
+                        lager:error("Test message"),
+                        %% not elegible for trace
+                        lager:log(error, self(), "Test message"),
+                        {ok, Bin3} = file:read_file(P++"/test_root_log/foo.log"),
+                        application:unset_env(lager, log_root),
+                        ?assertMatch([_, _, "[error]", _, "Test message\n"], re:split(Bin3, " ", [{return, list}, {parts, 5}]))
+                end
+            },
+            {"tracing with options should work",
+                fun() ->
+                        file:delete("foo.log"),
+                        {ok, _} = lager:trace_file("foo.log", [{module, ?MODULE}], [{size, 20}, {check_interval, 1}]), 
+                        lager:error("Test message"),
+                        ?assertNot(filelib:is_regular("foo.log.0")),
+                        %% rotation is sensitive to intervals between
+                        %% writes so we sleep to exceed the 1
+                        %% millisecond interval specified by
+                        %% check_interval above
+                        timer:sleep(2),
+                        lager:error("Test message"),
+                        timer:sleep(10),
+                        ?assert(filelib:is_regular("foo.log.0"))
                 end
             }
         ]

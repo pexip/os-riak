@@ -6,6 +6,7 @@
 #define STORAGE_LEVELDB_INCLUDE_OPTIONS_H_
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string>
 #include <memory>
 
@@ -30,7 +31,9 @@ enum CompressionType {
   // NOTE: do not change the values of existing entries, as these are
   // part of the persistent format on disk.
   kNoCompression     = 0x0,
-  kSnappyCompression = 0x1
+  kSnappyCompression = 0x1,
+  kLZ4Compression    = 0x2,
+  kNoCompressionAutomated = 0x3
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -216,6 +219,11 @@ struct Options {
   // Riak specific option with the path prefix used for "slow" disk
   // array.  levels tiered_slow_level through 6 use this path prefix
   std::string tiered_slow_prefix;
+
+  // Riak specific option that writes a list of open table files
+  // to disk on close then automatically opens same files again
+  // upon restart.
+  bool cache_object_warming;
 
   // Create an Options object with default values for all fields.
   Options();

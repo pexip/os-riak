@@ -821,10 +821,6 @@ class PosixEnv : public Env {
   }  // SleepForMicroSeconds
 
 
-  virtual int GetBackgroundBacklog() const
-    {return(gImmThreads->m_WorkQueueAtomic + gWriteThreads->m_WorkQueueAtomic
-          + gLevel0Threads->m_WorkQueueAtomic + gCompactionThreads->m_WorkQueueAtomic);};
-
   virtual size_t RecoveryMmapSize(const struct Options * options) const
     {
       size_t map_size;
@@ -853,13 +849,6 @@ class PosixEnv : public Env {
     }
   }
 
-  // BGThread() is the body of the background thread
-  void BGThread();
-  static void* BGThreadWrapper(void* arg) {
-    reinterpret_cast<PosixEnv*>(arg)->BGThread();
-    return NULL;
-  }
-
   size_t page_size_;
   pthread_mutex_t mu_;
   pthread_cond_t bgsignal_;
@@ -868,18 +857,15 @@ class PosixEnv : public Env {
   // Entry per Schedule() call
   struct BGItem { void* arg; void (*function)(void*); int priority;};
 
-  volatile uint64_t write_rate_usec_; // recently experienced average time to
-                                      // write one key during background compaction
-
 };
 
 
 PosixEnv::PosixEnv() : page_size_(getpagesize()),
-                       clock_res_(1), write_rate_usec_(0)
+                       clock_res_(1)
 {
-  struct timespec ts;
 
 #if _POSIX_TIMERS >= 200801L
+  struct timespec ts;
   clock_getres(CLOCK_MONOTONIC, &ts);
   clock_res_=ts.tv_sec*1000000+ts.tv_nsec/1000;
   if (0==clock_res_)
@@ -1105,10 +1091,8 @@ void Env::Shutdown()
 {
     if (started)
     {
-        delete default_env;
-        default_env=NULL;
-
-        ThrottleShutdown();
+        // prevent throttle from initiating new compactions
+        ThrottleStopThreads();
     }   // if
 
     DBListShutdown();
@@ -1124,6 +1108,16 @@ void Env::Shutdown()
 
     delete gCompactionThreads;
     gCompactionThreads=NULL;
+
+    if (started)
+    {
+        // release throttle globals now that
+        //  background compaction threads done
+        ThrottleClose();
+
+        delete default_env;
+        default_env=NULL;
+    }   // if
 
     // wait until compaction threads complete before
     //  releasing comparator object (else segfault possible)

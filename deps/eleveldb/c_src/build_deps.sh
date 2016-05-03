@@ -8,7 +8,7 @@ if [ `uname -s` = 'SunOS' -a "${POSIX_SHELL}" != "true" ]; then
 fi
 unset POSIX_SHELL # clear it so if we invoke other scripts, they run as ksh as well
 
-LEVELDB_VSN="2.0.0"
+LEVELDB_VSN="2.0.17"
 
 SNAPPY_VSN="1.0.4"
 
@@ -40,6 +40,7 @@ case "$1" in
         if [ -d leveldb ]; then
             (cd leveldb && $MAKE clean)
         fi
+        rm -f ../priv/leveldb_repair ../priv/sst_scan ../priv/sst_rewrite ../priv/perf_dump
         ;;
 
     test)
@@ -47,6 +48,7 @@ case "$1" in
         export CXXFLAGS="$CXXFLAGS -I $BASEDIR/system/include"
         export LDFLAGS="$LDFLAGS -L$BASEDIR/system/lib"
         export LD_LIBRARY_PATH="$BASEDIR/system/lib:$LD_LIBRARY_PATH"
+        export LEVELDB_VSN="$LEVELDB_VSN"
 
         (cd leveldb && $MAKE check)
 
@@ -56,6 +58,9 @@ case "$1" in
         if [ ! -d leveldb ]; then
             git clone git://github.com/basho/leveldb
             (cd leveldb && git checkout $LEVELDB_VSN)
+            if [ "$BASHO_EE" = "1" ]; then
+                (cd leveldb && git submodule update --init)
+            fi
         fi
         ;;
 
@@ -65,19 +70,31 @@ case "$1" in
             (cd snappy-$SNAPPY_VSN && ./configure --prefix=$BASEDIR/system --libdir=$BASEDIR/system/lib --with-pic)
         fi
 
-        (cd snappy-$SNAPPY_VSN && $MAKE && $MAKE install)
+        if [ ! -f system/lib/libsnappy.a ]; then
+            (cd snappy-$SNAPPY_VSN && $MAKE && $MAKE install)
+        fi
 
         export CFLAGS="$CFLAGS -I $BASEDIR/system/include"
         export CXXFLAGS="$CXXFLAGS -I $BASEDIR/system/include"
         export LDFLAGS="$LDFLAGS -L$BASEDIR/system/lib"
         export LD_LIBRARY_PATH="$BASEDIR/system/lib:$LD_LIBRARY_PATH"
+        export LEVELDB_VSN="$LEVELDB_VSN"
 
         if [ ! -d leveldb ]; then
             git clone git://github.com/basho/leveldb
             (cd leveldb && git checkout $LEVELDB_VSN)
+            if [ $BASHO_EE = "1" ]; then
+                (cd leveldb && git submodule update --init)
+            fi
         fi
 
-        (cd leveldb && $MAKE all)
+        # hack issue where high level make is running -j 4
+        #  and causes build errors in leveldb
+        export MAKEFLAGS=
+
+        (cd leveldb && $MAKE -j 3 all)
+        (cd leveldb && $MAKE -j 3 tools)
+        (cp leveldb/perf_dump leveldb/sst_rewrite leveldb/sst_scan leveldb/leveldb_repair ../priv)
 
         ;;
 esac

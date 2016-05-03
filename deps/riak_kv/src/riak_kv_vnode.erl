@@ -50,7 +50,8 @@
          request_hashtree_pid/1,
          request_hashtree_pid/2,
          reformat_object/2,
-         stop_fold/1]).
+         stop_fold/1,
+         get_modstate/1]).
 
 %% riak_core_vnode API
 -export([init/1,
@@ -95,8 +96,10 @@
 -ifdef(TEST).
 %% Use values so that test compile doesn't give 'unused vars' warning.
 -define(INDEX(A,B,C), _=element(1,{A,B,C}), ok).
+-define(INDEX_BIN(A,B,C,D,E), _=element(1,{A,B,C,D,E}), ok).
 -else.
 -define(INDEX(Obj, Reason, Partition), yz_kv:index(Obj, Reason, Partition)).
+-define(INDEX_BIN(Bucket, Key, Obj, Reason, Partition), yz_kv:index_binary(Bucket, Key, Obj, Reason, Partition)).
 -endif.
 
 -ifdef(TEST).
@@ -229,6 +232,12 @@ maybe_create_hashtrees(true, State=#state{idx=Index,
         _ ->
             State
     end.
+
+%% @doc Reveal the underlying module state for testing
+-spec(get_modstate(state()) -> {atom(), state()}).
+get_modstate(_State=#state{mod=Mod,
+                           modstate=ModState}) ->
+    {Mod, ModState}.
 
 %% API
 start_vnode(I) ->
@@ -468,10 +477,16 @@ init([Index]) ->
     case catch Mod:start(Index, Configuration) of
         {ok, ModState} ->
             %% Get the backend capabilities
+            DoAsyncPut =  case app_helper:get_env(riak_kv, allow_async_put, true) of
+                true ->
+                    erlang:function_exported(Mod, async_put, 5);
+                _ ->
+                    false
+            end,
             State = #state{idx=Index,
                            async_folding=AsyncFolding,
                            mod=Mod,
-                           async_put = erlang:function_exported(Mod, async_put, 5),
+                           async_put = DoAsyncPut,
                            modstate=ModState,
                            vnodeid=VId,
                            counter=CounterState,
@@ -637,7 +652,12 @@ handle_command({hashtree_pid, Node}, _, State=#state{hashtrees=HT}) ->
             case HT of
                 undefined ->
                     State2 = maybe_create_hashtrees(State),
-                    {reply, {ok, State2#state.hashtrees}, State2};
+                    case State2#state.hashtrees of
+                        undefined ->
+                            {reply, {error, wrong_node}, State2};
+                        _ ->
+                            {reply, {ok, State2#state.hashtrees}, State2}
+                    end;
                 _ ->
                     {reply, {ok, HT}, State}
             end;
@@ -836,6 +856,7 @@ handle_command(?KV_W1C_PUT_REQ{bkey={Bucket, Key}, encoded_obj=EncodedVal, type=
     case Mod:put(Bucket, Key, [], EncodedVal, ModState) of
         {ok, UpModState} ->
             update_hashtree(Bucket, Key, EncodedVal, State),
+            ?INDEX_BIN(Bucket, Key, EncodedVal, put, Idx),
             update_vnode_stats(vnode_put, Idx, StartTS),
             {reply, ?KV_W1C_PUT_REPLY{reply=ok, type=Type}, State#state{modstate=UpModState}};
         {error, Reason, UpModState} ->
@@ -1041,8 +1062,16 @@ handle_handoff_command(Req=?KV_PUT_REQ{}, Sender, State) ->
     end;
 
 handle_handoff_command(?KV_W1C_PUT_REQ{}=Request, Sender, State) ->
-    {noreply, NewState} = handle_command(Request, Sender, State),
-    {forward, NewState};
+    NewState0 = case handle_command(Request, Sender, State) of
+        {noreply, NewState} ->
+            NewState;
+        {reply, Reply, NewState} ->
+            %% reply directly to the sender, as we will be forwarding the
+            %% the request on to the handoff node.
+            riak_core_vnode:reply(Sender, Reply),
+            NewState
+    end,
+    {forward, NewState0};
 
 %% Handle all unspecified cases locally without forwarding
 handle_handoff_command(Req, Sender, State) ->
@@ -1152,13 +1181,21 @@ delete(State=#state{status_mgr_pid=StatusMgr, mod=Mod, modstate=ModState}) ->
     end,
     {ok, State#state{modstate=UpdModState,vnodeid=undefined,hashtrees=undefined}}.
 
-terminate(_Reason, #state{mod=Mod, modstate=ModState}) ->
+terminate(_Reason, #state{mod=Mod, modstate=ModState,hashtrees=Trees}) ->
     Mod:stop(ModState),
+
+    %% Explicitly stop the hashtree rather than relying on the process monitor
+    %% to detect the vnode exit.  As riak_kv_index_hashtree is not a supervised
+    %% process in the riak_kv application, on graceful shutdown riak_kv and
+    %% riak_core can complete their shutdown before the hashtree is written
+    %% to disk causing the hashtree to be closed dirty.
+    riak_kv_index_hashtree:sync_stop(Trees),
     ok.
 
 handle_info({{w1c_async_put, From, Type, Bucket, Key, EncodedVal, StartTS} = _Context, Reply},
             State=#state{idx=Idx}) ->
     update_hashtree(Bucket, Key, EncodedVal, State),
+    ?INDEX_BIN(Bucket, Key, EncodedVal, put, Idx),
     riak_core_vnode:reply(From, ?KV_W1C_PUT_REPLY{reply=Reply, type=Type}),
     update_vnode_stats(vnode_put, Idx, StartTS),
     {ok, State};
@@ -2615,13 +2652,22 @@ highest_actor(ActorBase, Obj) ->
 
 -define(MGR, riak_kv_vnode_status_mgr).
 -define(MAX_INT, 4294967295).
+-define(DATA_DIR, "riak_kv_vnode_blocking_test").
+
+blocking_setup() ->
+    application:set_env(riak_core, platform_data_dir, ?DATA_DIR),
+    (catch file:delete(?DATA_DIR ++ "/kv_vnode/0")).
+
+blocking_teardown() ->
+    application:unset_env(riak_core, platform_data_dir),
+    (catch file:delete(?DATA_DIR ++ "/kv_vnode/0")).
 
 %% @private test the vnode and vnode mgr interaction NOTE: sets up and
 %% tearsdown inside the test, the mgr needs the pid of the test
 %% process to send messages. @TODO(rdb) find a better way
 blocking_test_() ->
-    {setup, fun() -> (catch file:delete("undefined/kv_vnode/0")) end,
-     fun(_) -> file:delete("undefined/kv_vnode/0") end,
+    {setup, fun() -> blocking_setup() end,
+     fun(_) -> blocking_teardown() end,
      {spawn, [{"Blocking",
                fun() ->
                        {ok, Pid} = ?MGR:start_link(self(), 0, true),
@@ -2733,7 +2779,7 @@ list_buckets_test_() ->
              clean_test_dirs(),
              application:start(sasl),
              Env = application:get_all_env(riak_kv),
-	     exometer:start(),
+             exometer:start(),
              riak_kv_stat:register_stats(),
              {ok, _} = riak_core_bg_manager:start(),
              riak_core_metadata_manager:start_link([{data_dir, "kv_vnode_test_meta"}]),
@@ -2743,7 +2789,7 @@ list_buckets_test_() ->
              riak_core_ring_manager:cleanup_ets(test),
              riak_kv_test_util:stop_process(riak_core_metadata_manager),
              riak_kv_test_util:stop_process(riak_core_bg_manager),
-	     exometer:stop(),
+             exometer:stop(),
              application:stop(sasl),
              [application:unset_env(riak_kv, K) ||
                  {K, _V} <- application:get_all_env(riak_kv)],

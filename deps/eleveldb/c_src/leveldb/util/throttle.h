@@ -26,16 +26,17 @@
 namespace leveldb
 {
 
-extern pthread_rwlock_t gThreadLock0;
-extern pthread_rwlock_t gThreadLock1;
-
-
 void ThrottleInit();
 
-void SetThrottleWriteRate(uint64_t Micros, uint64_t Keys, bool IsLevel0, int Backlog);
+void SetThrottleWriteRate(uint64_t Micros, uint64_t Keys, bool IsLevel0);
 
 uint64_t GetThrottleWriteRate();
+uint64_t GetUnadjustedThrottleWriteRate();
 
-void ThrottleShutdown();
+// step 1 in two step shutdown
+void ThrottleStopThreads();
+
+// step 2 in two step shutdown
+void ThrottleClose();
 
 }  // namespace leveldb

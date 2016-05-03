@@ -31,6 +31,12 @@ static const size_t kL0_CompactionTrigger = 6;
 // Level-0 (any overlapped level) number of files where a grooming
 //     compaction could start
 static const size_t kL0_GroomingTrigger = 4;
+static const size_t kL0_GroomingTrigger10min = 2;
+static const size_t kL0_GroomingTrigger20min = 1;
+
+// ... time limits in microseconds
+static const size_t kL0_Grooming10minMicros = 10 * 60 * 1000000;
+static const size_t kL0_Grooming20minMicros = 20 * 60 * 1000000;
 
 // Soft limit on number of level-0 files.  We slow down writes at this point.
 static const size_t kL0_SlowdownWritesTrigger = 8;
@@ -44,7 +50,8 @@ static const size_t kL0_StopWritesTrigger = 12;
 // expensive manifest file operations.  We do not push all the way to
 // the largest level since that can generate a lot of wasted disk
 // space if the same key space is being repeatedly overwritten.
-static const int kMaxMemCompactLevel = 2;
+// Basho: push to kNumOverlapLevels +1 ... beyond "landing level"
+static const unsigned kMaxMemCompactLevel = kNumOverlapLevels+1;
 
 }  // namespace config
 
@@ -55,7 +62,9 @@ class InternalKey;
 // data structures.
 enum ValueType {
   kTypeDeletion = 0x0,
-  kTypeValue = 0x1
+  kTypeValue = 0x1,
+  kTypeValueWriteTime = 0x2,
+  kTypeValueExplicitExpiry = 0x3
 };
 // kValueTypeForSeek defines the ValueType that should be passed when
 // constructing a ParsedInternalKey object for seeking to a particular
@@ -63,9 +72,15 @@ enum ValueType {
 // and the value type is embedded as the low 8 bits in the sequence
 // number in internal keys, we need to use the highest-numbered
 // ValueType, not the lowest).
+//  Riak note: kValueTypeForSeek is placed within temporary keys
+//             for comparisons.  Using kTypeValueExplicitExpiry would
+//             force more code changes to increase internal key size.
+//             But ValueTypeForSeek is redundant to sequence number for
+//             disambiguaty. Therefore going for easiest path and NOT changing.
 static const ValueType kValueTypeForSeek = kTypeValue;
 
 typedef uint64_t SequenceNumber;
+typedef uint64_t ExpiryTime;
 
 // We leave eight bits empty at the bottom so a type and sequence#
 // can be packed together into 64-bits.
@@ -74,20 +89,16 @@ static const SequenceNumber kMaxSequenceNumber =
 
 struct ParsedInternalKey {
   Slice user_key;
+  ExpiryTime expiry;
   SequenceNumber sequence;
   ValueType type;
 
   ParsedInternalKey() { }  // Intentionally left uninitialized (for speed)
-  ParsedInternalKey(const Slice& u, const SequenceNumber& seq, ValueType t)
-      : user_key(u), sequence(seq), type(t) { }
+  ParsedInternalKey(const Slice& u, const ExpiryTime & exp, const SequenceNumber& seq, ValueType t)
+      : user_key(u), expiry(exp), sequence(seq), type(t) { }
   std::string DebugString() const;
   std::string DebugStringHex() const;
 };
-
-// Return the length of the encoding of "key".
-inline size_t InternalKeyEncodingLength(const ParsedInternalKey& key) {
-  return key.user_key.size() + 8;
-}
 
 // Append the serialization of "key" to *result.
 extern void AppendInternalKey(std::string* result,
@@ -100,18 +111,59 @@ extern void AppendInternalKey(std::string* result,
 extern bool ParseInternalKey(const Slice& internal_key,
                              ParsedInternalKey* result);
 
-// Returns the user key portion of an internal key.
-inline Slice ExtractUserKey(const Slice& internal_key) {
-  assert(internal_key.size() >= 8);
-  return Slice(internal_key.data(), internal_key.size() - 8);
-}
-
 inline ValueType ExtractValueType(const Slice& internal_key) {
   assert(internal_key.size() >= 8);
   const size_t n = internal_key.size();
-  uint64_t num = DecodeFixed64(internal_key.data() + n - 8);
-  unsigned char c = num & 0xff;
+  unsigned char c = DecodeLeastFixed64(internal_key.data() + n - sizeof(SequenceNumber));
   return static_cast<ValueType>(c);
+}
+
+inline size_t KeySuffixSize(ValueType val_type) {
+  size_t ret_val;
+  switch(val_type)
+  {
+      case kTypeDeletion:
+      case kTypeValue:
+          ret_val=sizeof(SequenceNumber);
+          break;
+
+      case kTypeValueWriteTime:
+      case kTypeValueExplicitExpiry:
+          ret_val=sizeof(SequenceNumber) + sizeof(ExpiryTime);
+          break;
+
+      default:
+          // assert(0);  cannot use because bloom filter block's name is passed as internal key
+          ret_val=sizeof(SequenceNumber);
+          break;
+  }   // switch
+  return(ret_val);
+}
+
+inline size_t KeySuffixSize(const Slice & internal_key) {
+    return(KeySuffixSize(ExtractValueType(internal_key)));
+}
+
+// Returns the user key portion of an internal key.
+inline Slice ExtractUserKey(const Slice& internal_key) {
+  assert(internal_key.size() >= 8);
+  return Slice(internal_key.data(), internal_key.size() - KeySuffixSize(internal_key));
+}
+
+// Returns the sequence number with ValueType removed
+inline SequenceNumber ExtractSequenceNumber(const Slice& internal_key) {
+  assert(internal_key.size() >= 8);
+  return(DecodeFixed64(internal_key.data() + internal_key.size() - 8)>>8);
+}
+
+// Return the length of the encoding of "key".
+inline size_t InternalKeyEncodingLength(const ParsedInternalKey& key) {
+  return key.user_key.size() + KeySuffixSize(key.type);
+}
+
+// Riak: is this an expiry key and therefore contain extra ExpiryTime field
+inline bool IsExpiryKey(ValueType val_type) {
+  return(kTypeValueWriteTime==val_type || kTypeValueExplicitExpiry==val_type);
 }
 
 // A comparator for internal keys that uses a specified comparator for
@@ -158,8 +210,8 @@ class InternalKey {
   std::string rep_;
  public:
   InternalKey() { }   // Leave rep_ as empty to indicate it is invalid
-  InternalKey(const Slice& user_key, SequenceNumber s, ValueType t) {
-    AppendInternalKey(&rep_, ParsedInternalKey(user_key, s, t));
+  InternalKey(const Slice& user_key, ExpiryTime exp, SequenceNumber s, ValueType t) {
+    AppendInternalKey(&rep_, ParsedInternalKey(user_key, exp, s, t));
   }
 
   void DecodeFrom(const Slice& s) { rep_.assign(s.data(), s.size()); }
@@ -193,8 +245,12 @@ inline bool ParseInternalKey(const Slice& internal_key,
   unsigned char c = num & 0xff;
   result->sequence = num >> 8;
   result->type = static_cast<ValueType>(c);
-  result->user_key = Slice(internal_key.data(), n - 8);
-  return (c <= static_cast<unsigned char>(kTypeValue));
+  if (IsExpiryKey((ValueType)c))
+    result->expiry=DecodeFixed64(internal_key.data() + n - KeySuffixSize((ValueType)c));
+  else
+    result->expiry=0;
+  result->user_key = Slice(internal_key.data(), n - KeySuffixSize((ValueType)c));
+  return (c <= static_cast<unsigned char>(kTypeValueExplicitExpiry));
 }
 
 // A helper class useful for DBImpl::Get()
@@ -213,12 +269,14 @@ class LookupKey {
   Slice internal_key() const { return Slice(kstart_, end_ - kstart_); }
 
   // Return the user key
-  Slice user_key() const { return Slice(kstart_, end_ - kstart_ - 8); }
+  Slice user_key() const
+  { return Slice(kstart_, end_ - kstart_ - KeySuffixSize(internal_key())); }
 
  private:
   // We construct a char array of the form:
   //    klength  varint32               <-- start_
   //    userkey  char[klength]          <-- kstart_
+  //    optional uint64
   //    tag      uint64
   //                                    <-- end_
   // The array is a suitable MemTable key.
