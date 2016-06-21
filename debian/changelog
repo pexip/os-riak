@@ -1,3 +1,9 @@
+riak (2.1.4-2) pexip; urgency=low
+
+  * postinst: remove old v1 config files
+
+ -- Ben Hockley <ben@pexip.com>  Tue, 17 June 2016 16:22:25 +0100
+
 riak (2.1.4-1) pexip; urgency=low
 
   * New upstream release

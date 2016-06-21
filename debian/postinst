@@ -22,6 +22,10 @@ case "$1" in
     configure)
     # update-rc.d riak defaults
 
+    # remove any v1 config files left lying around
+    rm -rf /etc/riak/vm.args
+    rm -rf /etc/riak/app.config
+
     if ! getent group riak >/dev/null; then
 	addgroup --system riak
     fi
