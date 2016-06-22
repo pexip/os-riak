@@ -3,3 +3,4 @@
 03-customise-app-config.patch
 04-md5.patch
 05-remove-solr.patch
+06-add-maxatoms-cuttlefish.patch

@@ -1,0 +1,20 @@
+diff --git a/deps/cuttlefish/priv/erlang_vm.schema b/deps/cuttlefish/priv/erlang_vm.schema
+index cbdba40..e74ce34 100644
+--- a/deps/cuttlefish/priv/erlang_vm.schema
++++ b/deps/cuttlefish/priv/erlang_vm.schema
+@@ -258,6 +258,15 @@
+   {datatype, integer}
+ ]}.
+ 
++%% @doc Set the maximum number of atoms the VM can handle.
++%%
++%% More information: http://www.erlang.org/doc/man/erl.html#+t
++{mapping, "erlang.max_atoms_per_vm", "vm_args.+t", [
++  {commented, 1048576},
++  {datatype, integer}
++]}.
++
++
+ %% @doc Enable or disable scheduler compaction of load. By default
+ %% scheduler compaction of load is enabled. When enabled, load
+ %% balancing will strive for a load distribution which causes as many
