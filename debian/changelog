@@ -1,3 +1,9 @@
+riak (2.1.4-4) pexip; urgency=low
+
+  * riak: increase file handle limit again to suppress warnings.
+
+ -- Ben Hockley <ben@pexip.com>  Mon, 11 July 2016 14:38:25 +0100
+
 riak (2.1.4-3) pexip; urgency=low
 
   * cuttlefish: expose beam -t option as erlang.max_atoms_per_vm in riak.conf
