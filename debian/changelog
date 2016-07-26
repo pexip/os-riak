@@ -1,3 +1,9 @@
+riak (2.1.4-5) pexip; urgency=low
+
+  * riak: Be robust in the face of riak shutdown deadlock (pexip issue #7164)
+
+ -- Ben Hockley <ben@pexip.com>  Tue, 26 July 2016 16:05:25 +0100
+
 riak (2.1.4-4) pexip; urgency=low
 
   * riak: increase file handle limit again to suppress warnings.

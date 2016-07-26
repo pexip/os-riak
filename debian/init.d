@@ -56,7 +56,8 @@ do_stop()
 	# Identify the erts directory
 	ERTS_PATH=`$DAEMON ertspath`
 
-	$DAEMON stop
+	# Workaround Pexip issue #7164 (until basho fixes the underlying problem)
+	/usr/bin/timeout 30 $DAEMON stop || ( echo "Graceful riak stop failed or timed out; will kill" && /usr/bin/killall -KILL $ERTS_PATH/beam.smp || echo "Graceful riak stop succeeded or riak not running" )
 
 	# Return
 	#   0 if daemon has been stopped
