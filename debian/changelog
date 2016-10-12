@@ -1,3 +1,9 @@
+riak (2.1.4-6) pexip; urgency=low
+
+  * Rebuild against libssl1.0.2
+
+ -- John-Mark Bell <jmb@pexip.com>  Wed, 12 Oct 2016 02:58:41 +0100
+
 riak (2.1.4-5) pexip; urgency=low
 
   * riak: Be robust in the face of riak shutdown deadlock (pexip issue #7164)
