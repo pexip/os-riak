@@ -1,3 +1,9 @@
+riak (2.1.4-7) pexip; urgency=low
+
+  * Remove dh_installinit call.
+
+ -- Alan Ford <alan@pexip.com>  Tue, 22 Nov 2016 15:00:19 +0000
+
 riak (2.1.4-6) pexip; urgency=low
 
   * Rebuild against libssl1.0.2
